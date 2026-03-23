@@ -83,7 +83,7 @@
  *     written to a temporary global buffer between the two phases.  Keeping all
  *     16 blocks resident in registers simultaneously would require ~2560 bytes per
  *     thread (10 blocks × 16 float32 per thread), which exceeds the practical
- *     register budget.  The present design amortises global-memory traffic across
+ *     register budget.  The present design amortizes global-memory traffic across
  *     STEPS iterations by keeping the kernel structure simple and letting the GPU's
  *     L1/L2 cache absorb repeated reads.
  */
@@ -285,19 +285,29 @@ neumann_inverse_kernel(const T* __restrict__ L_base,
 
   auto block_shape = make_shape(Int<TILE>{}, Int<TILE>{});
 
-  // Helper: row-major (TILE×TILE) tensor view of ptr[row_off*N + col_off]
+  // Helper: row-major (TILE×TILE) read-only tensor view of ptr[row_off*N + col_off].
+  // Used as the A argument of gemm_TTS (first matrix in the product).
   auto make_row = [&](const T* ptr, int row_off, int col_off) {
     return make_tensor(
         make_gmem_ptr(ptr + row_off * N + col_off),
         make_layout(block_shape, make_stride(N, _1{})));
   };
 
-  // Helper: col-major (TILE×TILE) tensor view — the "transposed" layout
-  // consumed by gemm_TTS as its B argument.
+  // Helper: col-major (TILE×TILE) read-only tensor view — the "transposed"
+  // layout consumed by gemm_TTS as its B argument.
   auto make_col = [&](const T* ptr, int row_off, int col_off) {
     return make_tensor(
         make_gmem_ptr(ptr + row_off * N + col_off),
         make_layout(block_shape, make_stride(_1{}, N)));
+  };
+
+  // Helper: row-major (TILE×TILE) writable tensor view.
+  // Used as the destination in write_block (get_block_2d_copy_D requires
+  // a non-const tensor pointer).
+  auto make_row_w = [&](T* ptr, int row_off, int col_off) {
+    return make_tensor(
+        make_gmem_ptr(ptr + row_off * N + col_off),
+        make_layout(block_shape, make_stride(N, _1{})));
   };
 
   // Coordinate / identity tensors for partitioning.
@@ -310,15 +320,10 @@ neumann_inverse_kernel(const T* __restrict__ L_base,
 
   auto tCrC = thr_mma.partition_sg_fragment_C(gC);
 
-  // Helper: make a D-copy (register → global) for a given destination block.
-  auto make_D_copy = [&](T* ptr, int row_off, int col_off) {
-    auto dst = make_row(ptr, row_off, col_off);
-    return get_block_2d_copy_D<void>(mma, dst);
-  };
-
   // Helper: write float32 fragment tCrC to a BF16 global memory block.
+  // ptr must be non-const since get_block_2d_copy_D writes to it.
   auto write_block = [&](T* ptr, int row_off, int col_off) {
-    auto dst          = make_row(ptr, row_off, col_off);
+    auto dst          = make_row_w(ptr, row_off, col_off);
     auto copy_D       = get_block_2d_copy_D<void>(mma, dst);
     auto thr_copy_D   = copy_D.get_slice(local_id);
     auto tCrD         = thr_copy_D.partition_sg_fragment_S(gC);

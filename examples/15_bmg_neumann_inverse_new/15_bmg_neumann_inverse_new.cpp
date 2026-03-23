@@ -276,6 +276,7 @@ int main(int argc, char const** argv)
               << "To benchmark with a different STEPS, recompile with the "
               << "desired value.\n\n";
     steps = 14;
+    options.steps = 14;
   }
 
   // -------------------------------------------------------------------------
