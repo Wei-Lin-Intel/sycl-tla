@@ -80,8 +80,11 @@ using namespace chunk_inverse;
 // ---------------------------------------------------------------------------
 using ElementA = bfloat16_t;
 
-// TiledMMA for the 16×16×16 inverse kernel (1 sub-group, 16 threads).
-// chunk_gemm_policy_16x16x16: WGTile=(16,16,16), SGLayout=(1,1,1).
+// TiledMMA for the 16×16×16 inverse kernel.
+// - MMA atom : XE_8x16x16_F32BF16BF16F32_TT (8×16×16 DPAS, 16 threads / sub-group)
+// - CTA tile : 16×16×16  →  2 DPAS atoms in M to cover the 16-row block
+// - WarpLayout: (1,1,1)  →  exactly 1 sub-group (16 threads) per work-group
+// This matches `chunk_gemm_policy_16x16x16` from vllm-xpu-kernels.
 using InverseMMA = typename TiledMMAHelper<
     MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>,
     Layout<Shape<_16, _16, _16>>,
@@ -127,8 +130,11 @@ struct Options {
     return out;
   }
 
-  // Estimated FLOPs for B inversions of an N×N lower-triangular matrix.
-  // We use ~N^3/3 as a rough lower bound (similar to triangular solve).
+  // Estimated GFLOPs for B inversions of an N×N unit lower-triangular matrix.
+  // Each column j of the inverse requires roughly (N-j)² multiply-adds, giving
+  // a total of ~N³/3 FMAs.  We use 2 FLOPs per FMA and multiply by batch.
+  // This is a lower-bound estimate; the actual block-GEMM sequence performs more
+  // operations due to the four-block decomposition overhead.
   double gflops(double runtime_s) const {
     double N    = double(kMatrixDim);
     double flop = double(batch) * N * N * N / 3.0;

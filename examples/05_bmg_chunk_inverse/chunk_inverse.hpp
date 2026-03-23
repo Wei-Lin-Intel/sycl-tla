@@ -80,10 +80,15 @@ using namespace cute;
 // ---------------------------------------------------------------------------
 // gemm_TTS : C += A(row-major, M×K) · B(col-major, N×K)
 //
+// Name convention (from vllm-xpu-kernels gemm.hpp):
+//   T = first operand is a global Tensor (row-major layout)
+//   T = second operand is a global Tensor (col-major / "transposed" layout)
+//   S = accumulator is a register fragment (Sub-group fragment)
+//
 // Both A and B are global tensors; C is a register fragment.
-// The "transposed" (col-major) layout of B makes get_block_2d_copy_B load it
-// so that the DPAS instruction sees it as the correct B input, yielding the
-// standard matrix product  C += A · B.
+// The col-major (stride=(1, row_stride)) layout of B makes
+// get_block_2d_copy_B load it so that DPAS sees the correct B input,
+// yielding the standard matrix product  C += A · B.
 // ---------------------------------------------------------------------------
 template <class ATensor, class BTensor, class SGCTensor, class TiledMMA>
 CUTE_DEVICE void
@@ -158,6 +163,11 @@ gemm_TTS(ATensor const& A,   // (M, K) row-major  stride=(K_stride, 1)
 
 // ---------------------------------------------------------------------------
 // gemm_STS : C += A_reg(M×K, register fragment) · B(col-major, N×K)
+//
+// Name convention (from vllm-xpu-kernels gemm.hpp):
+//   S = first operand is a register fragment (already loaded from a prior gemm)
+//   T = second operand is a global Tensor (col-major layout)
+//   S = accumulator is a register fragment
 // ---------------------------------------------------------------------------
 template <class ASGCTensor, class BTensor, class CSGCTensor, class TiledMMA>
 CUTE_DEVICE void
@@ -261,7 +271,7 @@ chunk_inverse_opt_kernel(T* A_base, int batch_size)
     //                   Initialized to 0 for rows 0..sg_local_id (diagonal = 1
     //                   is kept implicitly; saving loop skips the diagonal).
     float A_local[16];
-    float A_other[16];
+    float A_other[16];  // broadcast values received from other sub-group lanes
 
     CUTE_UNROLL
     for (int e = 0; e < sg_local_id + 1; ++e) {
