@@ -340,6 +340,8 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size, int steps =
       clear(tCrC);
 
       // k_block starts at sg_col (not 0): err[k_block < sg_col][sg_col] = 0.
+      // Note: CUTE_UNROLL is not used here because the loop start (sg_col) is
+      // a runtime value; the inner-v loops below are still CUTE_UNROLL-ed.
       for (int k_block = sg_col; k_block < TTiles; ++k_block) {
         // Load A tile from slm_inv: inv[sg_row*TBlock..+TBlock][k_block*TBlock..+TBlock].
         CUTE_UNROLL
