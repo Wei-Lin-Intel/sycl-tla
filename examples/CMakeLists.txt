@@ -109,6 +109,7 @@ if(CUTLASS_ENABLE_SYCL)
       03_bmg_gemm_streamk/legacy
       04_bmg_grouped_gemm
       04_bmg_grouped_gemm/legacy
+      05_bmg_chunk_inverse
       05_bmg_gemm_with_epilogues
       05_bmg_gemm_with_epilogues/legacy
       06_bmg_flash_attention
