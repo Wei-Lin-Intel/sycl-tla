@@ -88,26 +88,36 @@ namespace neumann_inverse {
 using namespace cute;
 
 // ---------------------------------------------------------------------------
-// Constants
+// Fixed constants
 // ---------------------------------------------------------------------------
-static constexpr int kN      = 64;   // Fixed matrix dimension
-static constexpr int kSteps  = 14;   // Neumann iteration count (fixed)
-static constexpr int kBlock  = 16;   // DPAS tile size
-static constexpr int kTiles  = 4;    // kN / kBlock = 4 tiles per dimension
-static constexpr int kSGs    = 16;   // kTiles × kTiles sub-groups per work-group
-static constexpr int kSGSize = 16;   // Threads per sub-group (DPAS SIMD-16)
-static constexpr int kWGSize = kSGs * kSGSize;  // 256 threads per work-group
+static constexpr int kN = 64;   // Matrix dimension (fixed by algorithm / SLM budget)
 
 // ---------------------------------------------------------------------------
-// TiledMMA for one 16×16 DPAS tile.
-//   MMA atom : XE_8x16x16_F32BF16BF16F32_TT (8M×16N×16K DPAS, 16 threads / sub-group)
-//   WG tile  : 16×16×16  →  2 DPAS atoms stacked in M
-//   Sub-group layout: (1,1,1) →  exactly 1 sub-group (16 threads) per tile
+// Default tuning knobs (compile-time; override via template arguments below).
+//
+//   kBlock  – DPAS output-tile side length.  Must equal the N and K dimensions
+//             of the chosen MMA atom.  For XE_8x16x16_F32BF16BF16F32_TT the
+//             atom is 8×16×16, so kBlock = 16 is the only valid choice.
+//   kTiles  – Number of kBlock-sized tiles per matrix dimension (kN / kBlock).
+//             With kN=64 and kBlock=16 this is 4.  Changing kBlock requires a
+//             matching change here.
+//   kSGSize – Threads per sub-group.  The XE_8x16x16 DPAS instruction operates
+//             on SIMD-16 sub-groups, so kSGSize = 16 is the only valid value
+//             for this atom.
+//
+// Derived constants:
+//   kSGs    = kTiles × kTiles      (sub-groups per work-group)
+//   kWGSize = kSGs   × kSGSize     (threads per work-group)
+//   kSteps  – Neumann iteration count.  Exposed as a runtime argument to
+//             neumann_inverse_kernel so it can be tuned without recompilation.
+//             14 is the default; fewer iterations run faster but reduce accuracy.
 // ---------------------------------------------------------------------------
-using TileMMA = typename TiledMMAHelper<
-    MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>,
-    Layout<Shape<_16, _16, _16>>,
-    Layout<Shape<_1, _1, _1>, Stride<_1, _1, _0>>>::TiledMMA;
+static constexpr int kBlock  = 16;
+static constexpr int kTiles  = 4;
+static constexpr int kSGSize = 16;
+static constexpr int kSGs    = kTiles * kTiles;
+static constexpr int kWGSize = kSGs * kSGSize;
+static constexpr int kSteps  = 14;
 
 // ---------------------------------------------------------------------------
 // neumann_inverse_kernel
@@ -115,22 +125,43 @@ using TileMMA = typename TiledMMAHelper<
 // Each work-group inverts one 64×64 unit lower-triangular BF16 matrix.
 // L_base : input   – batch of B matrices, shape [B, 64, 64] row-major
 // Out_base: output – batch of B inverse matrices, shape [B, 64, 64] row-major
+// steps  : number of Neumann iterations (default kSteps = 14)
+//
+// Template parameters:
+//   TBlock  – DPAS tile side length (must match MMA atom; default 16).
+//   TTiles  – Tiles per matrix dimension, i.e. kN/TBlock (default 4).
+//   TSGSize – Threads per sub-group (must match MMA atom; default 16).
 // ---------------------------------------------------------------------------
-template <typename T>
+template <typename T,
+          int TBlock  = kBlock,
+          int TTiles  = kTiles,
+          int TSGSize = kSGSize>
 CUTE_DEVICE void
-neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
+neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size, int steps = kSteps)
 {
+  // Derived compile-time constants from template parameters.
+  constexpr int TSGs    = TTiles * TTiles;   // sub-groups per work-group
+  constexpr int TWGSize = TSGs * TSGSize;    // threads per work-group
+
+  // TiledMMA for one TBlock×TBlock DPAS tile.
+  //   MMA atom : XE_8x16x16_F32BF16BF16F32_TT (8M×16N×16K DPAS, 16 threads)
+  //   WG tile  : TBlock×TBlock×TBlock → 2 DPAS atoms stacked in M (for TBlock=16)
+  //   Sub-group layout: (1,1,1) → exactly 1 sub-group (TSGSize threads) per tile
+  using TileMMA = typename TiledMMAHelper<
+      MMA_Atom<XE_8x16x16_F32BF16BF16F32_TT>,
+      Layout<Shape<Int<TBlock>, Int<TBlock>, Int<TBlock>>>,
+      Layout<Shape<_1, _1, _1>, Stride<_1, _1, _0>>>::TiledMMA;
   auto item     = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int  batch_id = item.get_group(2);      // one work-group per matrix in batch
   if (batch_id >= batch_size) return;
 
   auto wg       = item.get_group();
   auto sg        = item.get_sub_group();
-  int  sg_id     = static_cast<int>(sg.get_group_linear_id()); // 0..15
-  int  sg_row    = sg_id / kTiles;         // tile row   (0..3)
-  int  sg_col    = sg_id % kTiles;         // tile column (0..3)
-  int  local_id  = static_cast<int>(sg.get_local_linear_id()); // 0..15 within sub-group
-  int  global_tid = sg_id * kSGSize + local_id; // 0..255 within work-group
+  int  sg_id     = static_cast<int>(sg.get_group_linear_id()); // 0..TSGs-1
+  int  sg_row    = sg_id / TTiles;         // tile row   (0..TTiles-1)
+  int  sg_col    = sg_id % TTiles;         // tile column (0..TTiles-1)
+  int  local_id  = static_cast<int>(sg.get_local_linear_id()); // 0..TSGSize-1 within sub-group
+  int  global_tid = sg_id * TSGSize + local_id; // 0..TWGSize-1 within work-group
 
   // ---------------------------------------------------------------------------
   // SLM layout (row-major BF16, stride = kN = 64):
@@ -147,10 +178,7 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
   const T* L_ptr   = L_base   + static_cast<int64_t>(batch_id) * kN * kN;
   T*       Out_ptr = Out_base  + static_cast<int64_t>(batch_id) * kN * kN;
 
-  // ---------------------------------------------------------------------------
-  // Cooperative initialization: all 256 threads load L and initialize inv = I.
-  // ---------------------------------------------------------------------------
-  for (int i = global_tid; i < kN * kN; i += kWGSize) {
+  for (int i = global_tid; i < kN * kN; i += TWGSize) {
     slm_L[i] = L_ptr[i];
     int row   = i / kN;
     int col   = i % kN;
@@ -160,14 +188,14 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
 
   // ---------------------------------------------------------------------------
   // Set up TiledMMA and thread-level coordinate fragments.
-  // Each sub-group handles one kBlock×kBlock (16×16) output tile using 16 threads.
+  // Each sub-group handles one TBlock×TBlock output tile using TSGSize threads.
   // ---------------------------------------------------------------------------
   TileMMA mma{};
-  auto wg_tile  = mma.tile_mnk();            // (16, 16, 16)
+  auto wg_tile  = mma.tile_mnk();            // (TBlock, TBlock, TBlock)
   auto thr_mma  = mma.get_slice(local_id);
 
   // Coordinate/identity tensors (shapes only; used to allocate register fragments).
-  auto A_shape  = make_shape(Int<kBlock>{}, Int<kBlock>{});
+  auto A_shape  = make_shape(Int<TBlock>{}, Int<TBlock>{});
   Tensor cA     = make_identity_tensor(A_shape);
   Tensor cB     = make_identity_tensor(A_shape);
   Tensor cC     = make_identity_tensor(A_shape);
@@ -189,9 +217,9 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
   int n_half = (local_id % 2) * 8;   // 0 or 8  (same partitioning for C)
 
   // ---------------------------------------------------------------------------
-  // Neumann iteration loop  (kSteps = 14, fixed)
+  // Neumann iteration loop  (runtime `steps` iterations, default kSteps = 14)
   // ---------------------------------------------------------------------------
-  for (int step = 0; step < kSteps; ++step) {
+  for (int step = 0; step < steps; ++step) {
 
     // =========================================================================
     // Phase 1 – Compute err = L × inv  (64×64 blocked GEMM in SLM)
@@ -200,29 +228,29 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
     clear(tCrC);
 
     CUTE_UNROLL
-    for (int k_block = 0; k_block < kTiles; ++k_block) {
-      // Load A tile from slm_L: L[sg_row*16..+16][k_block*16..+16]  (row-major BF16)
+    for (int k_block = 0; k_block < TTiles; ++k_block) {
+      // Load A tile from slm_L: L[sg_row*TBlock..+TBlock][k_block*TBlock..+TBlock]  (row-major BF16)
       // ALayout: thread t holds A[m_dpas][(t%2)*8..(t%2)*8+7] per DPAS atom.
       CUTE_UNROLL
       for (int v = 0; v < 8; ++v) {
-        // Atom 0 (M rows 0..7 of the 16-row tile):
+        // Atom 0 (M rows 0..7 of the TBlock-row tile):
         tCrA(v) = slm_L[
-            (sg_row * kBlock + m_dpas) * kN +
-            k_block * kBlock + k_half + v];
-        // Atom 1 (M rows 8..15 of the 16-row tile):
+            (sg_row * TBlock + m_dpas) * kN +
+            k_block * TBlock + k_half + v];
+        // Atom 1 (M rows 8..15 of the TBlock-row tile):
         tCrA(8+v) = slm_L[
-            (sg_row * kBlock + 8 + m_dpas) * kN +
-            k_block * kBlock + k_half + v];
+            (sg_row * TBlock + 8 + m_dpas) * kN +
+            k_block * TBlock + k_half + v];
       }
 
-      // Load B tile from slm_inv: inv[k_block*16..+16][sg_col*16..+16]
-      // Column-major (B) interpretation: thread t holds B[k=0..15][n=t].
-      // B[k][t] = inv[k_block*16 + k][sg_col*16 + t] → row-major SLM index.
+      // Load B tile from slm_inv: inv[k_block*TBlock..+TBlock][sg_col*TBlock..+TBlock]
+      // Column-major (B) interpretation: thread t holds B[k=0..TBlock-1][n=t].
+      // B[k][t] = inv[k_block*TBlock + k][sg_col*TBlock + t] → row-major SLM index.
       CUTE_UNROLL
       for (int v = 0; v < 16; ++v) {
         tCrB(v) = slm_inv[
-            (k_block * kBlock + v) * kN +
-            sg_col * kBlock + local_id];
+            (k_block * TBlock + v) * kN +
+            sg_col * TBlock + local_id];
       }
 
       // DPAS: tCrC += A × B
@@ -256,11 +284,11 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
     CUTE_UNROLL
     for (int v = 0; v < 8; ++v) {
       // Atom 0
-      slm_err[(sg_row * kBlock + m_dpas) * kN +
-               sg_col * kBlock + n_half + v] = T(tCrC(v));
+      slm_err[(sg_row * TBlock + m_dpas) * kN +
+               sg_col * TBlock + n_half + v] = T(tCrC(v));
       // Atom 1
-      slm_err[(sg_row * kBlock + 8 + m_dpas) * kN +
-               sg_col * kBlock + n_half + v] = T(tCrC(8+v));
+      slm_err[(sg_row * TBlock + 8 + m_dpas) * kN +
+               sg_col * TBlock + n_half + v] = T(tCrC(8+v));
     }
 
     // Synchronize: all sub-groups must see the complete slm_err before Phase 2.
@@ -273,26 +301,26 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
     clear(tCrC);
 
     CUTE_UNROLL
-    for (int k_block = 0; k_block < kTiles; ++k_block) {
-      // Load A tile from slm_inv: inv[sg_row*16..+16][k_block*16..+16].
+    for (int k_block = 0; k_block < TTiles; ++k_block) {
+      // Load A tile from slm_inv: inv[sg_row*TBlock..+TBlock][k_block*TBlock..+TBlock].
       CUTE_UNROLL
       for (int v = 0; v < 8; ++v) {
         tCrA(v) = slm_inv[
-            (sg_row * kBlock + m_dpas) * kN +
-            k_block * kBlock + k_half + v];
+            (sg_row * TBlock + m_dpas) * kN +
+            k_block * TBlock + k_half + v];
         tCrA(8+v) = slm_inv[
-            (sg_row * kBlock + 8 + m_dpas) * kN +
-            k_block * kBlock + k_half + v];
+            (sg_row * TBlock + 8 + m_dpas) * kN +
+            k_block * TBlock + k_half + v];
       }
 
-      // Load B tile from slm_err: err[k_block*16..+16][sg_col*16..+16].
+      // Load B tile from slm_err: err[k_block*TBlock..+TBlock][sg_col*TBlock..+TBlock].
       // err is strictly lower-triangular; zero elements produce zero accumulation
       // automatically, so we load unconditionally (simpler, correct result).
       CUTE_UNROLL
       for (int v = 0; v < 16; ++v) {
         tCrB(v) = slm_err[
-            (k_block * kBlock + v) * kN +
-            sg_col * kBlock + local_id];
+            (k_block * TBlock + v) * kN +
+            sg_col * TBlock + local_id];
       }
 
       // DPAS: tCrC += inv × err
@@ -309,14 +337,14 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
     // Different sub-groups write to non-overlapping tiles → no conflict.
     CUTE_UNROLL
     for (int v = 0; v < 8; ++v) {
-      // Atom 0: row = sg_row*16 + m_dpas, col = sg_col*16 + n_half + v
-      int idx0 = (sg_row * kBlock + m_dpas) * kN +
-                  sg_col * kBlock + n_half + v;
+      // Atom 0: row = sg_row*TBlock + m_dpas, col = sg_col*TBlock + n_half + v
+      int idx0 = (sg_row * TBlock + m_dpas) * kN +
+                  sg_col * TBlock + n_half + v;
       slm_inv[idx0] = T(float(slm_inv[idx0]) - tCrC(v));
 
-      // Atom 1: row = sg_row*16 + 8 + m_dpas, col = sg_col*16 + n_half + v
-      int idx1 = (sg_row * kBlock + 8 + m_dpas) * kN +
-                  sg_col * kBlock + n_half + v;
+      // Atom 1: row = sg_row*TBlock + 8 + m_dpas, col = sg_col*TBlock + n_half + v
+      int idx1 = (sg_row * TBlock + 8 + m_dpas) * kN +
+                  sg_col * TBlock + n_half + v;
       slm_inv[idx1] = T(float(slm_inv[idx1]) - tCrC(8+v));
     }
 
@@ -328,7 +356,7 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
   // ---------------------------------------------------------------------------
   // Write final inverse from SLM to global memory (output).
   // ---------------------------------------------------------------------------
-  for (int i = global_tid; i < kN * kN; i += kWGSize) {
+  for (int i = global_tid; i < kN * kN; i += TWGSize) {
     Out_ptr[i] = slm_inv[i];
   }
 }

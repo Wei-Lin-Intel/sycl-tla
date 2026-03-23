@@ -36,24 +36,31 @@
     the iterative Neumann algorithm ported from
     `python/opt_tril_inverse_triton.py` (`tril_inverse_iterative_64_bf16_kernel`).
 
-    Algorithm (STEPS=14, fixed):
+    Algorithm (STEPS tunable at runtime, default 14):
         inv = I
-        for _ in range(STEPS):
+        for _ in range(steps):
             err = lower_strict(L * inv)   // strictly-lower-triangular part
             inv = inv - inv * err
 
     Kernel design:
-      - One work-group (16 sub-groups × 16 threads = 256 threads) per matrix.
-      - L, inv, and err are kept in shared local memory (SLM) across all 14 iterations,
+      - One work-group (kSGs sub-groups × kSGSize threads) per matrix.
+      - L, inv, and err are kept in shared local memory (SLM) across all iterations,
         avoiding global-memory traffic for intermediate state.
       - The two GEMM products (L*inv and inv*err) are computed via Intel DPAS instructions
         through CuTe's TiledMMA / cute::gemm building blocks.
+
+    Tuning knobs (see --help):
+      --steps   : Neumann iteration count (runtime, default 14).  Fewer = faster, less accurate.
+      --block   : DPAS tile size (compile-time, fixed at 16 for XE_8x16x16 atom).
+      --tiles   : Tiles per dimension = kN/kBlock (compile-time, fixed at 4 for kN=64).
+      --sgs     : Sub-groups per work-group = kTiles² (compile-time, fixed at 16).
+      --sgsize  : Threads per sub-group (compile-time, fixed at 16 for DPAS SIMD-16).
 
     To build & run (from your build directory):
 
       $ ninja 05_bmg_neumann_inverse
       $ ./examples/sycl/05_bmg_neumann_inverse/05_bmg_neumann_inverse \
-            --batch=16 --iterations=100
+            --batch=16 --iterations=100 --steps=14
 
     Call with `--help` for information about available options.
 */
@@ -94,6 +101,27 @@ struct Options {
   int batch      = 16;
   int iterations = 100;
 
+  // Tuning knobs exposed on the command line.
+  //
+  // --steps    : Neumann iteration count.  Fewer → faster but less accurate.
+  //              Default 14 is the minimum that passes the BF16 tolerance check.
+  //
+  // --block    : DPAS tile size (compile-time constant, informational only).
+  //              Must equal the N/K dimension of the MMA atom; 16 is the only
+  //              valid value for XE_8x16x16_F32BF16BF16F32_TT.
+  //
+  // --tiles    : kN / kBlock (informational only).  Fixed at 4 for kN=64, kBlock=16.
+  //
+  // --sgs      : kTiles² sub-groups per work-group (informational only).
+  //
+  // --sgsize   : Threads per sub-group (compile-time constant, informational only).
+  //              Must be 16 for DPAS SIMD-16.
+  int steps  = kSteps;
+  int block  = kBlock;
+  int tiles  = kTiles;
+  int sgs    = kSGs;
+  int sgsize = kSGSize;
+
   void parse(int argc, char const** args) {
     cutlass::CommandLine cmd(argc, args);
 
@@ -104,49 +132,88 @@ struct Options {
 
     cmd.get_cmd_line_argument("batch",      batch,      16);
     cmd.get_cmd_line_argument("iterations", iterations, 100);
+    cmd.get_cmd_line_argument("steps",      steps,      kSteps);
+    cmd.get_cmd_line_argument("block",      block,      kBlock);
+    cmd.get_cmd_line_argument("tiles",      tiles,      kTiles);
+    cmd.get_cmd_line_argument("sgs",        sgs,        kSGs);
+    cmd.get_cmd_line_argument("sgsize",     sgsize,     kSGSize);
 
-    if (batch <= 0 || iterations <= 0) {
-      std::cerr << "Error: --batch and --iterations must be positive.\n";
+    if (batch <= 0 || iterations <= 0 || steps <= 0) {
+      std::cerr << "Error: --batch, --iterations, and --steps must be positive.\n";
+      error = true;
+      return;
+    }
+
+    // Validate compile-time-constrained parameters.
+    bool bad_config = false;
+    if (block != kBlock) {
+      std::cerr << "Error: --block=" << block
+                << " is not supported. Only --block=" << kBlock
+                << " is valid for the XE_8x16x16 DPAS atom.\n";
+      bad_config = true;
+    }
+    if (tiles != kTiles) {
+      std::cerr << "Error: --tiles=" << tiles
+                << " is not supported. Only --tiles=" << kTiles
+                << " is valid for kN=" << kN << ", kBlock=" << kBlock << ".\n";
+      bad_config = true;
+    }
+    if (sgs != kSGs) {
+      std::cerr << "Error: --sgs=" << sgs
+                << " is not supported. Only --sgs=" << kSGs
+                << " is valid (kTiles²=" << kTiles << "²).\n";
+      bad_config = true;
+    }
+    if (sgsize != kSGSize) {
+      std::cerr << "Error: --sgsize=" << sgsize
+                << " is not supported. Only --sgsize=" << kSGSize
+                << " is valid for DPAS SIMD-16.\n";
+      bad_config = true;
+    }
+    if (bad_config) {
       error = true;
     }
   }
 
   std::ostream& print_usage(std::ostream& out) const {
     out << "BMG Neumann Inverse Benchmark (64×64 BF16 lower-triangular inverse)\n\n"
-        << "Uses the iterative Neumann algorithm (STEPS=" << kSteps << "):\n"
+        << "Uses the iterative Neumann algorithm:\n"
         << "  inv = I\n"
-        << "  for _ in range(STEPS):\n"
+        << "  for _ in range(steps):\n"
         << "      err = lower_strict(L * inv)\n"
         << "      inv = inv - inv * err\n\n"
         << "Options:\n\n"
         << "  --help                   Display this usage statement\n"
         << "  --batch=<int>            Number of 64×64 matrices (default: 16)\n"
-        << "  --iterations=<int>       Profiling iterations (default: 100)\n\n"
+        << "  --iterations=<int>       Profiling iterations (default: 100)\n"
+        << "  --steps=<int>            Neumann iterations (default: " << kSteps << "; fewer=faster, less accurate)\n"
+        << "\n"
+        << "Informational (compile-time constants, cannot be changed at runtime):\n"
+        << "  --block=<int>            DPAS tile size (fixed: " << kBlock << " for XE_8x16x16 atom)\n"
+        << "  --tiles=<int>            Tiles per dimension kN/kBlock (fixed: " << kTiles << " for kN=64)\n"
+        << "  --sgs=<int>              Sub-groups per work-group kTiles² (fixed: " << kSGs << ")\n"
+        << "  --sgsize=<int>           Threads per sub-group (fixed: " << kSGSize << " for DPAS SIMD-16)\n"
+        << "\n"
         << "Example:\n"
-        << "  $ 05_bmg_neumann_inverse --batch=64 --iterations=200\n\n";
+        << "  $ 05_bmg_neumann_inverse --batch=64 --iterations=200 --steps=10\n\n";
     return out;
   }
 
   // Estimated GFLOPs for B inversions of an N×N unit lower-triangular matrix.
-  // The Neumann algorithm performs 2 × STEPS GEMMs of shape (N×N)×(N×N) → 2*STEPS*2*N^3 FLOPs.
+  // The Neumann algorithm performs 2 × steps GEMMs of shape (N×N)×(N×N) → 2*steps*2*N^3 FLOPs.
   double gflops(double runtime_s) const {
     double N    = double(kN);
-    double flop = double(batch) * 2.0 * double(kSteps) * 2.0 * N * N * N;
+    double flop = double(batch) * 2.0 * double(steps) * 2.0 * N * N * N;
     return flop / 1.0e9 / runtime_s;
   }
 };
 
 // ---------------------------------------------------------------------------
-// Kernel launcher tag
-// ---------------------------------------------------------------------------
-struct NeumannInverseKernel;
-
-// ---------------------------------------------------------------------------
-// Validation
+// Validation (forward-declared before launch_config which calls it)
 //
 // Compute L · L_inv on the CPU (float arithmetic) and verify that the result
 // is close to identity.  Tolerances are generous given BF16 precision and the
-// iterative nature of the algorithm with only STEPS=14 iterations.
+// iterative nature of the algorithm.
 // ---------------------------------------------------------------------------
 bool verify(const std::vector<ElementA>& L_host,
             const std::vector<ElementA>& L_inv_host,
@@ -169,7 +236,7 @@ bool verify(const std::vector<ElementA>& L_host,
         float expected = (row == col) ? 1.0f : 0.0f;
         float diff     = std::abs(val - expected);
         // Tolerances: BF16 has ~2 decimal digits; the iterative algorithm
-        // with only 14 steps is approximate, so use generous thresholds.
+        // with fewer steps is approximate, so use generous thresholds.
         if (diff > 0.1f) {
           std::cout << "Validation failed at batch=" << b
                     << " (" << row << "," << col << ")"
@@ -182,6 +249,92 @@ bool verify(const std::vector<ElementA>& L_host,
     }
   }
   return passed;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel launcher tag (templated so different compile-time configs each get
+// a distinct SYCL kernel name, which is required by the SYCL spec).
+// ---------------------------------------------------------------------------
+template <int TBlock, int TTiles, int TSGSize>
+struct NeumannInverseKernel {};
+
+// ---------------------------------------------------------------------------
+// launch_config<TBlock, TTiles, TSGSize>
+//
+// Runs the full benchmark (warmup → validation → timed iterations) for the
+// given compile-time configuration.  `steps` is the runtime Neumann iteration
+// count captured from the command line.
+// ---------------------------------------------------------------------------
+template <int TBlock, int TTiles, int TSGSize>
+int launch_config(const Options& options,
+                  ElementA* L_ptr,
+                  ElementA* Out_ptr,
+                  const std::vector<ElementA>& h_L_orig,
+                  int batch,
+                  int iterations,
+                  int steps)
+{
+  constexpr int TSGs    = TTiles * TTiles;
+  constexpr int TWGSize = TSGs * TSGSize;
+
+  sycl::range<3> local{1, 1, static_cast<size_t>(TWGSize)};
+  sycl::range<3> global{1, 1, static_cast<size_t>(TWGSize * batch)};
+
+  namespace syclex  = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  syclex::properties kernel_props{syclex::sub_group_size<TSGSize>,
+                                  intelex::grf_size<256>};
+
+  int batch_n = batch;
+  int warmup  = 3;
+
+  auto launch_kernel = [&]() {
+    return compat::get_default_queue().parallel_for<NeumannInverseKernel<TBlock, TTiles, TSGSize>>(
+        sycl::nd_range<3>(global, local), kernel_props,
+        [=](sycl::nd_item<3>) {
+          neumann_inverse_kernel<ElementA, TBlock, TTiles, TSGSize>(
+              L_ptr, Out_ptr, batch_n, steps);
+        });
+  };
+
+  // Warmup.
+  for (int i = 0; i < warmup; ++i) {
+    launch_kernel().wait();
+  }
+
+  // Validation: run once and download the result.
+  launch_kernel().wait();
+
+  static constexpr int N = kN;
+  std::vector<ElementA> h_Out(batch * N * N);
+  compat::get_default_queue()
+      .memcpy(h_Out.data(), Out_ptr, batch * N * N * sizeof(ElementA))
+      .wait();
+
+  bool passed = verify(h_L_orig, h_Out, batch);
+  if (!passed) {
+    std::cout << "\nAccuracy check FAILED.\n";
+    return 1;
+  }
+  std::cout << "Accuracy check passed.\n\n";
+
+  // Timed runs.
+  GPU_Clock timer;
+  timer.start();
+
+  for (int i = 0; i < iterations; ++i) {
+    launch_kernel().wait();
+  }
+
+  double total_ms = timer.seconds() * 1000.0;
+  double avg_ms   = total_ms / double(iterations);
+  double gflops   = options.gflops(avg_ms / 1000.0);
+
+  std::cout << "Performance\n"
+            << "  Avg latency : " << avg_ms  << " ms\n"
+            << "  GFLOPs      : " << gflops  << " (estimated)\n";
+
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +356,7 @@ int main(int argc, char const** argv)
 
   int batch      = options.batch;
   int iterations = options.iterations;
-  int warmup     = 3;
+  int steps      = options.steps;
 
   static constexpr int N = kN;
 
@@ -211,14 +364,17 @@ int main(int argc, char const** argv)
             << "  batch      : " << batch      << "\n"
             << "  matrix dim : " << N << "x" << N << "\n"
             << "  dtype      : BF16\n"
-            << "  steps      : " << kSteps     << " (Neumann iterations, fixed)\n"
-            << "  warmup     : " << warmup     << "\n"
+            << "  steps      : " << steps      << " (Neumann iterations, runtime-tunable)\n"
+            << "  block      : " << options.block  << " (DPAS tile size, compile-time)\n"
+            << "  tiles      : " << options.tiles  << " (tiles per dim, compile-time)\n"
+            << "  sgs        : " << options.sgs    << " (sub-groups per WG, compile-time)\n"
+            << "  sgsize     : " << options.sgsize << " (threads per SG, compile-time)\n"
             << "  iterations : " << iterations << "\n\n";
 
   // -------------------------------------------------------------------------
   // Generate random unit lower-triangular BF16 matrices on host.
   // Random strictly-lower values are kept small (scale 0.2) so the Neumann
-  // series converges within STEPS=14 iterations (matches Python reference).
+  // series converges within a reasonable number of steps.
   // -------------------------------------------------------------------------
   std::srand(42);
   std::vector<ElementA> h_L(batch * N * N, ElementA(0));
@@ -235,7 +391,7 @@ int main(int argc, char const** argv)
     }
   }
 
-  std::vector<ElementA> h_L_orig = h_L;   // save for validation / repeated launches
+  std::vector<ElementA> h_L_orig = h_L;   // save for validation
 
   // -------------------------------------------------------------------------
   // Allocate device memory for input (L) and output (inverse).
@@ -249,71 +405,11 @@ int main(int argc, char const** argv)
       .wait();
 
   // -------------------------------------------------------------------------
-  // Kernel launch configuration.
-  //   - 256 threads per work-group (16 sub-groups × 16 threads)
-  //   - batch work-groups (one per matrix)
+  // Dispatch to the (single currently valid) compile-time configuration.
   // -------------------------------------------------------------------------
-  sycl::range<3> local{1, 1, static_cast<size_t>(kWGSize)};
-  sycl::range<3> global{1, 1, static_cast<size_t>(kWGSize * batch)};
-
-  namespace syclex  = sycl::ext::oneapi::experimental;
-  namespace intelex = sycl::ext::intel::experimental;
-  syclex::properties kernel_props{syclex::sub_group_size<kSGSize>,
-                                  intelex::grf_size<256>};
-
-  ElementA* L_ptr   = d_L.get();
-  ElementA* Out_ptr = d_Out.get();
-  int       batch_n = batch;
-
-  auto launch_kernel = [&]() {
-    return compat::get_default_queue().parallel_for<NeumannInverseKernel>(
-        sycl::nd_range<3>(global, local), kernel_props,
-        [=](sycl::nd_item<3>) {
-          neumann_inverse_kernel<ElementA>(L_ptr, Out_ptr, batch_n);
-        });
-  };
-
-  // -------------------------------------------------------------------------
-  // Warmup runs.
-  // -------------------------------------------------------------------------
-  for (int i = 0; i < warmup; ++i) {
-    launch_kernel().wait();
-  }
-
-  // -------------------------------------------------------------------------
-  // Validation: run once and download the result.
-  // -------------------------------------------------------------------------
-  launch_kernel().wait();
-
-  std::vector<ElementA> h_Out(batch * N * N);
-  compat::get_default_queue()
-      .memcpy(h_Out.data(), d_Out.get(), batch * N * N * sizeof(ElementA))
-      .wait();
-
-  bool passed = verify(h_L_orig, h_Out, batch);
-  if (!passed) {
-    std::cout << "\nAccuracy check FAILED.\n";
-    return 1;
-  }
-  std::cout << "Accuracy check passed.\n\n";
-
-  // -------------------------------------------------------------------------
-  // Timed runs (kernel-only latency).
-  // -------------------------------------------------------------------------
-  GPU_Clock timer;
-  timer.start();
-
-  for (int i = 0; i < iterations; ++i) {
-    launch_kernel().wait();
-  }
-
-  double total_ms = timer.seconds() * 1000.0;
-  double avg_ms   = total_ms / double(iterations);
-  double gflops   = options.gflops(avg_ms / 1000.0);
-
-  std::cout << "Performance\n"
-            << "  Avg latency : " << avg_ms  << " ms\n"
-            << "  GFLOPs      : " << gflops  << " (estimated)\n";
-
-  return 0;
+  return launch_config<kBlock, kTiles, kSGSize>(
+      options,
+      d_L.get(), d_Out.get(),
+      h_L_orig,
+      batch, iterations, steps);
 }
