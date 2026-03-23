@@ -200,10 +200,12 @@ struct Options {
   }
 
   // Estimated GFLOPs for B inversions of an N×N unit lower-triangular matrix.
-  // The Neumann algorithm performs 2 × steps GEMMs of shape (N×N)×(N×N) → 2*steps*2*N^3 FLOPs.
+  // Each Neumann step runs 2 GEMMs (L×inv and inv×err), each of shape N×N×N.
+  // One N×N×N GEMM costs 2*N^3 FLOPs (multiply-add pairs), so:
+  //   total FLOPs = batch × steps × 2 GEMMs × 2*N^3 = 4 * batch * steps * N^3
   double gflops(double runtime_s) const {
     double N    = double(kN);
-    double flop = double(batch) * 2.0 * double(steps) * 2.0 * N * N * N;
+    double flop = double(batch) * double(steps) * 2.0 /* GEMMs/step */ * 2.0 * N * N * N;
     return flop / 1.0e9 / runtime_s;
   }
 };
