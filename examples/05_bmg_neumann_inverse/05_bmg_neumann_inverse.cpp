@@ -68,7 +68,6 @@
 #include <cute/tensor.hpp>
 #include <cute/util/compat.hpp>
 
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
 
 #include "cutlass/util/GPU_Clock.hpp"
@@ -283,9 +282,10 @@ int launch_config(const Options& options,
   sycl::range<3> global{1, 1, static_cast<size_t>(TWGSize * batch)};
 
   namespace syclex  = sycl::ext::oneapi::experimental;
-  namespace intelex = sycl::ext::intel::experimental;
-  syclex::properties kernel_props{syclex::sub_group_size<TSGSize>,
-                                  intelex::grf_size<256>};
+  // Use default GRF allocation (grf_size<256> measured ~10% slower on BMG for
+  // this kernel: low DPAS utilisation means larger GRF reduces occupancy without
+  // helping throughput).
+  syclex::properties kernel_props{syclex::sub_group_size<TSGSize>};
 
   int batch_n = batch;
   int warmup  = 3;
