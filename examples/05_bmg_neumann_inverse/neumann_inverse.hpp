@@ -218,137 +218,177 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size, int steps =
 
   // ---------------------------------------------------------------------------
   // Neumann iteration loop  (runtime `steps` iterations, default kSteps = 14)
+  //
+  // Structural optimizations vs. the naive port:
+  //
+  //   (A) Skip Phase 1 GEMM for upper-triangle SGs (sg_row < sg_col).
+  //       L and inv are both lower-triangular, so (L×inv)[upper] = 0 exactly.
+  //       The GEMM result would be zeroed anyway; skip the DPAS calls entirely.
+  //       These tiles are also never written to slm_err.
+  //
+  //   (B) Skip Phase 2 entirely for upper-triangle SGs (sg_row < sg_col).
+  //       Since inv is lower-triangular and err is strictly lower-triangular,
+  //       (inv×err)[upper] = 0 exactly.  inv[upper] = 0 is invariant and never
+  //       needs updating.
+  //
+  //   (C) Start Phase 2 k_block at sg_col, not 0.
+  //       err[k_block][sg_col] = 0 for k_block < sg_col (upper-triangle tiles
+  //       of err, which are never written by Phase 1 with optimization A).
+  //       Skipping those k_block iterations avoids 0×anything DPAS calls.
+  //
+  // Together (A)+(B)+(C) reduce GEMM calls per step from 128 to 70 (~45%).
+  //   Phase 1: 10 lower/diag SGs × TTiles k_blocks = 40  (was 64).
+  //   Phase 2: Σ_{sg_col=0}^{TTiles-1} SGs_in_col × (TTiles−sg_col) = 30  (was 64).
+  //
+  // The three group_barrier calls per step remain mandatory:
+  //   Barrier A – slm_err written before Phase 2 reads it.
+  //   Barrier B – slm_inv read by Phase 2 before any SG writes the update
+  //               (SG(r,c1) must not write slm_inv[r][c1] while SG(r,c2) still
+  //               reads slm_inv[r][c1] in its k_block=c1 iteration).
+  //   Barrier C – slm_inv update complete before next step's Phase 1 reads it.
   // ---------------------------------------------------------------------------
   for (int step = 0; step < steps; ++step) {
 
     // =========================================================================
     // Phase 1 – Compute err = L × inv  (64×64 blocked GEMM in SLM)
     //           then apply strictly-lower-triangular mask.
+    //
+    // Optimization (A): upper-triangle SGs (sg_row < sg_col) skip the GEMM.
+    // They write nothing to slm_err; Phase 2's k_block loop (optimization C)
+    // starts at sg_col and never reads those upper-triangle err tiles.
     // =========================================================================
-    clear(tCrC);
+    if (sg_row >= sg_col) {
+      clear(tCrC);
 
-    CUTE_UNROLL
-    for (int k_block = 0; k_block < TTiles; ++k_block) {
-      // Load A tile from slm_L: L[sg_row*TBlock..+TBlock][k_block*TBlock..+TBlock]  (row-major BF16)
-      // ALayout: thread t holds A[m_dpas][(t%2)*8..(t%2)*8+7] per DPAS atom.
+      CUTE_UNROLL
+      for (int k_block = 0; k_block < TTiles; ++k_block) {
+        // Load A tile from slm_L: L[sg_row*TBlock..+TBlock][k_block*TBlock..+TBlock]  (row-major BF16)
+        // ALayout: thread t holds A[m_dpas][(t%2)*8..(t%2)*8+7] per DPAS atom.
+        CUTE_UNROLL
+        for (int v = 0; v < 8; ++v) {
+          // Atom 0 (M rows 0..7 of the TBlock-row tile):
+          tCrA(v) = slm_L[
+              (sg_row * TBlock + m_dpas) * kN +
+              k_block * TBlock + k_half + v];
+          // Atom 1 (M rows 8..15 of the TBlock-row tile):
+          tCrA(8+v) = slm_L[
+              (sg_row * TBlock + 8 + m_dpas) * kN +
+              k_block * TBlock + k_half + v];
+        }
+
+        // Load B tile from slm_inv: inv[k_block*TBlock..+TBlock][sg_col*TBlock..+TBlock]
+        // Column-major (B) interpretation: thread t holds B[k=0..TBlock-1][n=t].
+        // B[k][t] = inv[k_block*TBlock + k][sg_col*TBlock + t] → row-major SLM index.
+        CUTE_UNROLL
+        for (int v = 0; v < 16; ++v) {
+          tCrB(v) = slm_inv[
+              (k_block * TBlock + v) * kN +
+              sg_col * TBlock + local_id];
+        }
+
+        // DPAS: tCrC += A × B
+        cute::gemm(mma, tCrA, tCrB, tCrC);
+      }
+
+      // Apply strictly-lower-triangular mask to tCrC (err = lower_strict(L*inv)).
+      // sg_row == sg_col → diagonal block: zero elements where row_local ≤ col_local.
+      // sg_row  > sg_col → entire block is strictly lower-triangular: keep all.
+      if (sg_row == sg_col) {
+        CUTE_UNROLL
+        for (int v = 0; v < 8; ++v) {
+          // Atom 0: local row = m_dpas, local col = n_half + v
+          if (m_dpas <= n_half + v) tCrC(v)   = 0.0f;
+          // Atom 1: local row = 8 + m_dpas, local col = n_half + v
+          if (8 + m_dpas <= n_half + v) tCrC(8+v) = 0.0f;
+        }
+      }
+      // sg_row > sg_col: keep all (entire block is strictly lower-triangular).
+
+      // Write masked err to SLM (float → BF16).
       CUTE_UNROLL
       for (int v = 0; v < 8; ++v) {
-        // Atom 0 (M rows 0..7 of the TBlock-row tile):
-        tCrA(v) = slm_L[
-            (sg_row * TBlock + m_dpas) * kN +
-            k_block * TBlock + k_half + v];
-        // Atom 1 (M rows 8..15 of the TBlock-row tile):
-        tCrA(8+v) = slm_L[
-            (sg_row * TBlock + 8 + m_dpas) * kN +
-            k_block * TBlock + k_half + v];
-      }
-
-      // Load B tile from slm_inv: inv[k_block*TBlock..+TBlock][sg_col*TBlock..+TBlock]
-      // Column-major (B) interpretation: thread t holds B[k=0..TBlock-1][n=t].
-      // B[k][t] = inv[k_block*TBlock + k][sg_col*TBlock + t] → row-major SLM index.
-      CUTE_UNROLL
-      for (int v = 0; v < 16; ++v) {
-        tCrB(v) = slm_inv[
-            (k_block * TBlock + v) * kN +
-            sg_col * TBlock + local_id];
-      }
-
-      // DPAS: tCrC += A × B
-      cute::gemm(mma, tCrA, tCrB, tCrC);
-    }
-
-    // Apply strictly-lower-triangular mask to tCrC (err = lower_strict(L*inv)).
-    // For the (sg_row, sg_col) output block:
-    //   sg_row < sg_col → entire block is upper triangular → zero all.
-    //   sg_row = sg_col → diagonal block → zero row ≤ col elements.
-    //   sg_row > sg_col → entire block is strictly lower → keep all.
-    if (sg_row < sg_col) {
-      // Zero the entire upper-triangular / on-diagonal block.
-      CUTE_UNROLL
-      for (int i = 0; i < static_cast<int>(tCrC.size()); ++i) {
-        tCrC(i) = 0.0f;
-      }
-    } else if (sg_row == sg_col) {
-      // Zero elements where (row_local ≤ col_local) within the 16×16 block.
-      CUTE_UNROLL
-      for (int v = 0; v < 8; ++v) {
-        // Atom 0: local row = m_dpas, local col = n_half + v
-        if (m_dpas <= n_half + v) tCrC(v)   = 0.0f;
-        // Atom 1: local row = 8 + m_dpas, local col = n_half + v
-        if (8 + m_dpas <= n_half + v) tCrC(8+v) = 0.0f;
+        // Atom 0
+        slm_err[(sg_row * TBlock + m_dpas) * kN +
+                 sg_col * TBlock + n_half + v] = T(tCrC(v));
+        // Atom 1
+        slm_err[(sg_row * TBlock + 8 + m_dpas) * kN +
+                 sg_col * TBlock + n_half + v] = T(tCrC(8+v));
       }
     }
-    // sg_row > sg_col: keep all (entire block is strictly lower-triangular).
+    // sg_row < sg_col: slm_err[sg_row][sg_col] tiles are not written.
+    // Phase 2's k_block loop (optimization C) starts at sg_col, so these
+    // upper-triangle err tiles are never read and their content does not matter.
 
-    // Write masked err to SLM (float → BF16).
-    CUTE_UNROLL
-    for (int v = 0; v < 8; ++v) {
-      // Atom 0
-      slm_err[(sg_row * TBlock + m_dpas) * kN +
-               sg_col * TBlock + n_half + v] = T(tCrC(v));
-      // Atom 1
-      slm_err[(sg_row * TBlock + 8 + m_dpas) * kN +
-               sg_col * TBlock + n_half + v] = T(tCrC(8+v));
-    }
-
-    // Synchronize: all sub-groups must see the complete slm_err before Phase 2.
+    // Barrier A: all sub-groups must see the complete slm_err before Phase 2.
     sycl::group_barrier(wg);
 
     // =========================================================================
     // Phase 2 – Compute update = inv × err  (64×64 blocked GEMM in SLM)
     //           then update inv = inv − update.
+    //
+    // Optimization (B): upper-triangle SGs (sg_row < sg_col) skip Phase 2.
+    //   Since inv is lower-triangular and err is strictly lower-triangular,
+    //   (inv×err)[upper] = 0 exactly, so slm_inv[upper] needs no update.
+    //   The invariant inv[upper] = 0 is maintained throughout all steps.
+    //
+    // Optimization (C): k_block loop starts at sg_col.
+    //   slm_err[k_block < sg_col][sg_col] = 0 (upper-triangle err tiles, not
+    //   written by Phase 1).  Those k_block iterations contribute nothing to
+    //   tCrC and are skipped.
     // =========================================================================
-    clear(tCrC);
+    if (sg_row >= sg_col) {
+      clear(tCrC);
 
-    CUTE_UNROLL
-    for (int k_block = 0; k_block < TTiles; ++k_block) {
-      // Load A tile from slm_inv: inv[sg_row*TBlock..+TBlock][k_block*TBlock..+TBlock].
-      CUTE_UNROLL
-      for (int v = 0; v < 8; ++v) {
-        tCrA(v) = slm_inv[
-            (sg_row * TBlock + m_dpas) * kN +
-            k_block * TBlock + k_half + v];
-        tCrA(8+v) = slm_inv[
-            (sg_row * TBlock + 8 + m_dpas) * kN +
-            k_block * TBlock + k_half + v];
+      // k_block starts at sg_col (not 0): err[k_block < sg_col][sg_col] = 0.
+      for (int k_block = sg_col; k_block < TTiles; ++k_block) {
+        // Load A tile from slm_inv: inv[sg_row*TBlock..+TBlock][k_block*TBlock..+TBlock].
+        CUTE_UNROLL
+        for (int v = 0; v < 8; ++v) {
+          tCrA(v) = slm_inv[
+              (sg_row * TBlock + m_dpas) * kN +
+              k_block * TBlock + k_half + v];
+          tCrA(8+v) = slm_inv[
+              (sg_row * TBlock + 8 + m_dpas) * kN +
+              k_block * TBlock + k_half + v];
+        }
+
+        // Load B tile from slm_err: err[k_block*TBlock..+TBlock][sg_col*TBlock..+TBlock].
+        CUTE_UNROLL
+        for (int v = 0; v < 16; ++v) {
+          tCrB(v) = slm_err[
+              (k_block * TBlock + v) * kN +
+              sg_col * TBlock + local_id];
+        }
+
+        // DPAS: tCrC += inv × err
+        cute::gemm(mma, tCrA, tCrB, tCrC);
       }
-
-      // Load B tile from slm_err: err[k_block*TBlock..+TBlock][sg_col*TBlock..+TBlock].
-      // err is strictly lower-triangular; zero elements produce zero accumulation
-      // automatically, so we load unconditionally (simpler, correct result).
-      CUTE_UNROLL
-      for (int v = 0; v < 16; ++v) {
-        tCrB(v) = slm_err[
-            (k_block * TBlock + v) * kN +
-            sg_col * TBlock + local_id];
-      }
-
-      // DPAS: tCrC += inv × err
-      cute::gemm(mma, tCrA, tCrB, tCrC);
     }
 
-    // Barrier: ensure every sub-group has finished reading slm_inv before any
-    // sub-group writes back its update.  Without this, sub-group (r, c0) may
-    // write slm_inv[r_tile][c0_tile] while sub-group (r, c1) is still reading
-    // slm_inv[r_tile][c0_tile] in its k_block=c0 iteration, causing wrong results.
+    // Barrier B: every sub-group must finish reading slm_inv before any
+    // sub-group writes back its update.  Without this, SG(r, c0) may
+    // write slm_inv[r][c0] while SG(r, c1) is still reading slm_inv[r][c0]
+    // in its k_block=c0 iteration, causing wrong results.
     sycl::group_barrier(wg);
 
-    // Update inv = inv − update (in-place subtraction in SLM).
+    // Apply inv = inv − update in-place (lower-triangle and diagonal SGs only).
     // Different sub-groups write to non-overlapping tiles → no conflict.
-    CUTE_UNROLL
-    for (int v = 0; v < 8; ++v) {
-      // Atom 0: row = sg_row*TBlock + m_dpas, col = sg_col*TBlock + n_half + v
-      int idx0 = (sg_row * TBlock + m_dpas) * kN +
-                  sg_col * TBlock + n_half + v;
-      slm_inv[idx0] = T(float(slm_inv[idx0]) - tCrC(v));
+    if (sg_row >= sg_col) {
+      CUTE_UNROLL
+      for (int v = 0; v < 8; ++v) {
+        // Atom 0: row = sg_row*TBlock + m_dpas, col = sg_col*TBlock + n_half + v
+        int idx0 = (sg_row * TBlock + m_dpas) * kN +
+                    sg_col * TBlock + n_half + v;
+        slm_inv[idx0] = T(float(slm_inv[idx0]) - tCrC(v));
 
-      // Atom 1: row = sg_row*TBlock + 8 + m_dpas, col = sg_col*TBlock + n_half + v
-      int idx1 = (sg_row * TBlock + 8 + m_dpas) * kN +
-                  sg_col * TBlock + n_half + v;
-      slm_inv[idx1] = T(float(slm_inv[idx1]) - tCrC(8+v));
+        // Atom 1: row = sg_row*TBlock + 8 + m_dpas, col = sg_col*TBlock + n_half + v
+        int idx1 = (sg_row * TBlock + 8 + m_dpas) * kN +
+                    sg_col * TBlock + n_half + v;
+        slm_inv[idx1] = T(float(slm_inv[idx1]) - tCrC(8+v));
+      }
     }
 
-    // Synchronize: all sub-groups must complete slm_inv writes before the next
+    // Barrier C: all sub-groups must complete slm_inv writes before the next
     // iteration reads slm_inv in Phase 1 (or Phase 2 of the next step).
     sycl::group_barrier(wg);
   } // end Neumann loop
