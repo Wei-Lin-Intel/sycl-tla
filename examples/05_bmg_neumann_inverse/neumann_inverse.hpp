@@ -38,7 +38,7 @@
  * ported from the Triton reference kernel `tril_inverse_iterative_64_bf16_kernel` in
  * `python/opt_tril_inverse_triton.py`.
  *
- * Algorithm (STEPS=12 iterations):
+ * Algorithm (STEPS=14 iterations):
  *   inv = I
  *   for _ in range(STEPS):
  *       err = lower_strict(L * inv)   // strictly lower-triangular part of L*inv
@@ -91,7 +91,7 @@ using namespace cute;
 // Constants
 // ---------------------------------------------------------------------------
 static constexpr int kN      = 64;   // Fixed matrix dimension
-static constexpr int kSteps  = 12;   // Neumann iteration count (fixed)
+static constexpr int kSteps  = 14;   // Neumann iteration count (fixed)
 static constexpr int kBlock  = 16;   // DPAS tile size
 static constexpr int kTiles  = 4;    // kN / kBlock = 4 tiles per dimension
 static constexpr int kSGs    = 16;   // kTiles × kTiles sub-groups per work-group

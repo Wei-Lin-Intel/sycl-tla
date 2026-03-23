@@ -36,7 +36,7 @@
     the iterative Neumann algorithm ported from
     `python/opt_tril_inverse_triton.py` (`tril_inverse_iterative_64_bf16_kernel`).
 
-    Algorithm (STEPS=12, fixed):
+    Algorithm (STEPS=14, fixed):
         inv = I
         for _ in range(STEPS):
             err = lower_strict(L * inv)   // strictly-lower-triangular part
