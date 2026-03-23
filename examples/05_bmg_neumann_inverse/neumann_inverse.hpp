@@ -189,7 +189,7 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
   int n_half = (local_id % 2) * 8;   // 0 or 8  (same partitioning for C)
 
   // ---------------------------------------------------------------------------
-  // Neumann iteration loop  (kSteps = 12, fixed)
+  // Neumann iteration loop  (kSteps = 14, fixed)
   // ---------------------------------------------------------------------------
   for (int step = 0; step < kSteps; ++step) {
 

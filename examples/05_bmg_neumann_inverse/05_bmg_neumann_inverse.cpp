@@ -44,7 +44,7 @@
 
     Kernel design:
       - One work-group (16 sub-groups × 16 threads = 256 threads) per matrix.
-      - L, inv, and err are kept in shared local memory (SLM) across all 12 iterations,
+      - L, inv, and err are kept in shared local memory (SLM) across all 14 iterations,
         avoiding global-memory traffic for intermediate state.
       - The two GEMM products (L*inv and inv*err) are computed via Intel DPAS instructions
         through CuTe's TiledMMA / cute::gemm building blocks.
@@ -146,7 +146,7 @@ struct NeumannInverseKernel;
 //
 // Compute L · L_inv on the CPU (float arithmetic) and verify that the result
 // is close to identity.  Tolerances are generous given BF16 precision and the
-// iterative nature of the algorithm with only STEPS=12 iterations.
+// iterative nature of the algorithm with only STEPS=14 iterations.
 // ---------------------------------------------------------------------------
 bool verify(const std::vector<ElementA>& L_host,
             const std::vector<ElementA>& L_inv_host,
@@ -169,7 +169,7 @@ bool verify(const std::vector<ElementA>& L_host,
         float expected = (row == col) ? 1.0f : 0.0f;
         float diff     = std::abs(val - expected);
         // Tolerances: BF16 has ~2 decimal digits; the iterative algorithm
-        // with only 12 steps is approximate, so use generous thresholds.
+        // with only 14 steps is approximate, so use generous thresholds.
         if (diff > 0.1f) {
           std::cout << "Validation failed at batch=" << b
                     << " (" << row << "," << col << ")"
@@ -218,7 +218,7 @@ int main(int argc, char const** argv)
   // -------------------------------------------------------------------------
   // Generate random unit lower-triangular BF16 matrices on host.
   // Random strictly-lower values are kept small (scale 0.2) so the Neumann
-  // series converges within STEPS=12 iterations (matches Python reference).
+  // series converges within STEPS=14 iterations (matches Python reference).
   // -------------------------------------------------------------------------
   std::srand(42);
   std::vector<ElementA> h_L(batch * N * N, ElementA(0));
