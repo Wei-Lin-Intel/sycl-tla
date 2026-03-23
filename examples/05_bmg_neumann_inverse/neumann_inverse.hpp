@@ -299,6 +299,12 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
       cute::gemm(mma, tCrA, tCrB, tCrC);
     }
 
+    // Barrier: ensure every sub-group has finished reading slm_inv before any
+    // sub-group writes back its update.  Without this, sub-group (r, c0) may
+    // write slm_inv[r_tile][c0_tile] while sub-group (r, c1) is still reading
+    // slm_inv[r_tile][c0_tile] in its k_block=c0 iteration, causing wrong results.
+    sycl::group_barrier(wg);
+
     // Update inv = inv − update (in-place subtraction in SLM).
     // Different sub-groups write to non-overlapping tiles → no conflict.
     CUTE_UNROLL
@@ -314,7 +320,8 @@ neumann_inverse_kernel(const T* L_base, T* Out_base, int batch_size)
       slm_inv[idx1] = T(float(slm_inv[idx1]) - tCrC(8+v));
     }
 
-    // Synchronize: all sub-groups must see updated slm_inv before next iteration.
+    // Synchronize: all sub-groups must complete slm_inv writes before the next
+    // iteration reads slm_inv in Phase 1 (or Phase 2 of the next step).
     sycl::group_barrier(wg);
   } // end Neumann loop
 
