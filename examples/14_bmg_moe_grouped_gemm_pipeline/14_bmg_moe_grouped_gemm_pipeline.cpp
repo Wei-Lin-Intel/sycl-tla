@@ -34,33 +34,42 @@
 
     This example implements a complete Mixture-of-Experts (MoE) pipeline using
     grouped GEMMs without rearranging (reordering/expanding) the input activation
-    matrix hidden_states. Instead, per-expert token lists (derived from topk_ids)
-    are used to build the grouped GEMM problem shapes and route tokens via
-    pointer offsets into a pre-sorted layout in global memory.
+    matrix hidden_states. There is NO separate gather kernel. Instead, Grouped
+    GEMM #1 picks up the selected token rows directly from hidden_states using
+    sorted_token_ids as an index array during computation.
 
     Pipeline stages:
-      1. Sort tokens by expert using topk_ids -> build sorted_token_ids and
-         tokens_per_expert arrays on host, then copy sorted hidden_states to
-         a contiguous per-expert layout in global memory (the "gather" step).
-      2. Grouped GEMM #1: sorted_hidden_states @ w13_weights^T
+      1. Build routing tables on host: sorted_token_ids (grouped by expert)
+         and tokens_per_expert from topk_ids.
+      2. Routed Grouped GEMM #1: hidden_states @ w13_weights^T
+         Each workgroup gathers the needed A-matrix rows from the original
+         hidden_states into a per-workgroup scratch buffer using
+         sorted_token_ids, then runs the standard GEMM tile on the staged data.
          -> intermediate [total_routed_tokens, 2*intermediate_size]  (BF16 compute)
       3. SiLU-gating activation (FP32 compute): for each token row, split
          the 2*intermediate_size columns into gate (first half) and up (second half),
          compute silu(gate) * up, producing [total_routed_tokens, intermediate_size]
       4. Grouped GEMM #2: silu_output @ w2_weights^T
          -> expert_output [total_routed_tokens, hidden_dim]  (BF16 compute)
+         (Standard grouped GEMM since silu_output is already contiguous per expert.)
       5. Scatter-reduce (FP32 compute): accumulate expert outputs back into the
-         original token order using topk_ids, then cast to BF16
+         original token order using sorted_token_ids, then cast to BF16
 
-    Design note on SLM vs registers:
-      The existing MoE grouped GEMM code path (example 12) routes tokens via
-      pointer arithmetic in global memory — each expert's A-matrix is a contiguous
-      block of rows in a pre-gathered buffer. This avoids SLM staging for the
-      routing itself. We follow the same approach: a host-side gather reorders
-      hidden_states rows into per-expert contiguous blocks before launching the
-      grouped GEMM kernel. This is practical and keeps the grouped GEMM mainloop
-      unchanged. The SiLU, gather, and scatter-reduce steps use simple SYCL
-      parallel_for kernels operating in registers.
+    Design note on SLM vs registers for the routed gather:
+      The per-tile gather in Grouped GEMM #1 stages A-tile rows into a
+      per-workgroup scratch region in global memory (not SLM). Each workgroup
+      cooperatively loads its needed rows from the scattered hidden_states via
+      sorted_token_ids, places them contiguously in the scratch buffer, then the
+      standard moe_gemm inner loop operates on the scratch buffer using 2D block
+      loads. Global memory staging was chosen over SLM because:
+        - A single K-tile slice of the M-tile fits in SLM (~16 KB), but the
+          full M-tile × K data for the 2D block copy surface descriptor needs
+          to be contiguous; staging into global memory lets the existing 2D
+          copy infrastructure work unchanged.
+        - The gather is cooperative across the workgroup and overlaps well
+          with the persistent scheduler's work distribution.
+      SiLU and scatter-reduce steps use simple SYCL parallel_for kernels
+      operating in registers.
 
     Usage:
       $ ./14_bmg_moe_grouped_gemm_pipeline [options]
@@ -96,6 +105,9 @@
 // Reuse MoE grouped GEMM infrastructure from example 12
 #include "../12_xe20_moe_gemm_cute_interface/moe_grouped_gemm.hpp"
 #include "../12_xe20_moe_gemm_cute_interface/moe_tile_scheduler.hpp"
+
+// Routed GEMM variant that gathers A-rows inside the kernel
+#include "moe_routed_gemm.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -163,8 +175,8 @@ struct Options {
 
 // SYCL kernel name tags
 template <typename, typename, typename, char, char, int> class MoEGemmKernelName;
+template <typename, typename, typename, char, char, int> class MoERoutedGemmKernelName;
 class SiluGatingKernelName;
-class GatherKernelName;
 class ScatterReduceKernelName;
 class ScatterReduceCastKernelName;
 
@@ -308,6 +320,33 @@ template <class TA, class TB> auto choose_tiled_mma(TA * /*A*/, TB * /*B*/) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Compute the total number of workgroups the persistent tile scheduler will use.
+// This is needed to allocate the per-workgroup scratch buffer for the routed GEMM.
+int compute_total_workgroups() {
+  int sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  cutlass::KernelHardwareInfo hw_info{0, sm_count};
+  auto dummy_problem_shape = cute::Shape<int, int, int>{1, 1, 1};
+  auto dummy_group_problem_shape =
+      cutlass::gemm::GroupProblemShape<Shape<int, int, int>>{
+          1, &dummy_problem_shape, nullptr};
+  using TileShape = Shape<_256, _128, _32>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  auto scheduler_params =
+      PersistentTileSchedulerXeMoE<ProblemShape>::to_underlying_arguments(
+          dummy_group_problem_shape, TileShape{}, ClusterShape{}, hw_info,
+          PersistentTileSchedulerXeMoE<ProblemShape>::Arguments{
+              1, RasterOrderOptions::AlongN});
+  auto gd = PersistentTileSchedulerXeMoE<ProblemShape>::get_grid_shape(
+      scheduler_params, dummy_group_problem_shape, TileShape{}, ClusterShape{},
+      hw_info,
+      PersistentTileSchedulerXeMoE<ProblemShape>::Arguments{
+          1, RasterOrderOptions::AlongN});
+  return gd.x * gd.y * gd.z;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Launch a grouped GEMM using the MoE tile scheduler (same as example 12)
 template <char layoutA, char layoutB, typename ElementA, typename ElementB,
           typename ElementD, int GemmId>
@@ -374,22 +413,74 @@ void launch_grouped_gemm(const ElementA *activations, const ElementB *weights,
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Gather kernel: reorder hidden_states rows based on sorted_token_ids
-// sorted_token_ids[i] gives the original token index for sorted position i
-void launch_gather(const cutlass::bfloat16_t *hidden_states,
-                   cutlass::bfloat16_t *sorted_hidden_states,
-                   const int32_t *sorted_token_ids,
-                   int total_routed_tokens, int hidden_dim) {
+// Launch a routed grouped GEMM for GEMM #1: gathers A-matrix rows from
+// hidden_states inside the kernel using sorted_token_ids.
+template <char layoutA, char layoutB, typename ElementA, typename ElementB,
+          typename ElementD, int GemmId>
+void launch_routed_grouped_gemm(const ElementA *hidden_states,
+                                const int32_t *sorted_token_ids,
+                                ElementA *scratch_a,
+                                const ElementB *weights,
+                                ElementD *outputs,
+                                const int gemm_n, const int gemm_k,
+                                const int *num_rows_per_expert_device,
+                                const int num_experts) {
+  int sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  cutlass::KernelHardwareInfo hw_info{0, sm_count};
+  auto dummy_problem_shape = cute::Shape<int, int, int>{1, gemm_k, gemm_n};
+  auto dummy_group_problem_shape =
+      cutlass::gemm::GroupProblemShape<Shape<int, int, int>>{
+          1, &dummy_problem_shape, nullptr};
+  using TileShape = Shape<_256, _128, _32>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  auto scheduler_params =
+      PersistentTileSchedulerXeMoE<ProblemShape>::to_underlying_arguments(
+          dummy_group_problem_shape, TileShape{}, ClusterShape{}, hw_info,
+          PersistentTileSchedulerXeMoE<ProblemShape>::Arguments{
+              1, RasterOrderOptions::AlongN});
+  auto group_distribution =
+      PersistentTileSchedulerXeMoE<ProblemShape>::get_grid_shape(
+          scheduler_params, dummy_group_problem_shape, TileShape{},
+          ClusterShape{}, hw_info,
+          PersistentTileSchedulerXeMoE<ProblemShape>::Arguments{
+              1, RasterOrderOptions::AlongN});
+  auto mma = choose_tiled_mma(hidden_states, weights);
+  auto MaxThreadsPerWorkgroup = size(mma);
+  dim3 local_range{MaxThreadsPerWorkgroup, 1, 1};
+
+  sycl::range<3> local = {local_range.z, local_range.y, local_range.x};
+  sycl::range<3> groups = {group_distribution.z, group_distribution.y,
+                           group_distribution.x};
+  sycl::range<3> global = {local[0] * groups[0], local[1] * groups[1],
+                           local[2] * groups[2]};
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+
+  syclex::properties kernel_props{syclex::sub_group_size<16>,
+#if (defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35))
+                                  intelex::grf_size<512>
+#else
+                                  intelex::grf_size<256>
+#endif
+  };
   sycl::queue Q = compat::get_default_queue();
-  auto event = Q.parallel_for<GatherKernelName>(
-      sycl::range<1>(total_routed_tokens * hidden_dim),
-      [=](sycl::id<1> idx) {
-        int linear = idx[0];
-        int token_idx = linear / hidden_dim;
-        int col = linear % hidden_dim;
-        int orig_token = sorted_token_ids[token_idx];
-        sorted_hidden_states[token_idx * hidden_dim + col] =
-            hidden_states[orig_token * hidden_dim + col];
+
+  constexpr int32_t TILE_M = 256;
+
+  auto event = Q.parallel_for<
+      MoERoutedGemmKernelName<ElementA, ElementB, ElementD, layoutA, layoutB,
+                              GemmId>>(
+      sycl::nd_range<3>(global, local), kernel_props, [=](auto) {
+        MoE::MoEGEMMRouted<XE_LOAD_2D<16, 32, 32, 16>,
+                           XE_LOAD_2D_VNNI<16, 32, 16, 16>,
+                           XE_STORE_2D<16, 8, 32>,
+                           'R', 'R', 'R'>(
+            hidden_states, sorted_token_ids, scratch_a,
+            weights, static_cast<void *>(nullptr), outputs, mma,
+            num_rows_per_expert_device, num_experts,
+            gemm_n, gemm_k, TILE_M, scheduler_params);
       });
   EventManager::getInstance().addEvent(event);
   Q.wait_and_throw();
@@ -602,9 +693,17 @@ void run_moe_pipeline(const Options &options) {
 
   // ---- Allocate intermediate buffers ----
 
-  // Sorted/gathered hidden states: [total_routed_tokens, hidden_dim]
-  cutlass::DeviceAllocation<cutlass::bfloat16_t> sorted_hidden_states;
-  sorted_hidden_states.reset(total_routed_tokens * hidden_dim);
+  // Per-workgroup scratch buffer for routed GEMM #1.
+  // Each workgroup stages its A-tile (TILE_M rows × hidden_dim cols) here.
+  constexpr int TILE_M = 256;
+  int total_workgroups = compute_total_workgroups();
+  int64_t scratch_size =
+      static_cast<int64_t>(total_workgroups) * TILE_M * hidden_dim;
+  cutlass::DeviceAllocation<cutlass::bfloat16_t> scratch_a;
+  scratch_a.reset(scratch_size);
+  std::cout << "  scratch buffer   : " << total_workgroups << " workgroups × "
+            << TILE_M << " × " << hidden_dim << " = "
+            << (scratch_size * 2) / (1024 * 1024) << " MB" << std::endl;
 
   // GEMM1 output: [total_routed_tokens, 2*intermediate_size]
   cutlass::DeviceAllocation<cutlass::bfloat16_t> gemm1_output;
@@ -630,24 +729,24 @@ void run_moe_pipeline(const Options &options) {
   GPU_Clock timer;
   timer.start();
 
-  // Step 1: Gather - reorder hidden_states by sorted_token_ids
-  launch_gather(hidden_states.get(), sorted_hidden_states.get(),
-                sorted_token_ids_device.get(), total_routed_tokens, hidden_dim);
-
-  // Step 2: Grouped GEMM #1 - sorted_hidden_states @ w13_weights^T
-  //   A: [tokens_per_expert[e], hidden_dim] for each expert (contiguous blocks in sorted_hidden_states)
+  // Step 1: Routed Grouped GEMM #1 - hidden_states @ w13_weights^T
+  //   The kernel fetches A-matrix rows directly from hidden_states using
+  //   sorted_token_ids (no separate gather step).
+  //   A: per-expert rows from hidden_states[sorted_token_ids[...], :hidden_dim]
   //   B: w13_weights[e]: [hidden_dim, 2*intermediate_size]
-  //   D: gemm1_output[e]: [tokens_per_expert[e], 2*intermediate_size]
-  launch_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
-                      cutlass::bfloat16_t, 1>(
-      sorted_hidden_states.get(), w13_weights.get(), gemm1_output.get(),
-      inter2, hidden_dim, tokens_per_expert_device.get(), num_experts);
+  //   D: gemm1_output: [total_routed_tokens, 2*intermediate_size] (contiguous per expert)
+  launch_routed_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
+                             cutlass::bfloat16_t, 1>(
+      hidden_states.get(), sorted_token_ids_device.get(), scratch_a.get(),
+      w13_weights.get(), gemm1_output.get(), inter2, hidden_dim,
+      tokens_per_expert_device.get(), num_experts);
 
-  // Step 3: SiLU gating activation (FP32 compute)
+  // Step 2: SiLU gating activation (FP32 compute)
   launch_silu_gating(gemm1_output.get(), silu_output.get(),
                      total_routed_tokens, intermediate_size);
 
-  // Step 4: Grouped GEMM #2 - silu_output @ w2_weights^T
+  // Step 3: Grouped GEMM #2 - silu_output @ w2_weights^T
+  //   silu_output is already contiguous per expert, so standard grouped GEMM.
   //   A: [tokens_per_expert[e], intermediate_size] for each expert
   //   B: w2_weights[e]: [intermediate_size, hidden_dim]
   //   D: gemm2_output[e]: [tokens_per_expert[e], hidden_dim]
@@ -656,7 +755,7 @@ void run_moe_pipeline(const Options &options) {
       silu_output.get(), w2_weights.get(), gemm2_output.get(), hidden_dim,
       intermediate_size, tokens_per_expert_device.get(), num_experts);
 
-  // Step 5: Scatter-reduce (FP32 compute, cast to BF16)
+  // Step 4: Scatter-reduce (FP32 compute, cast to BF16)
   launch_scatter_reduce(gemm2_output.get(), final_output.get(),
                         reduce_buffer.get(), sorted_token_ids_device.get(),
                         total_routed_tokens, num_tokens, hidden_dim);
