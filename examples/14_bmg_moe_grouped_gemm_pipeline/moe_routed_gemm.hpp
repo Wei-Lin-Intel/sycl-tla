@@ -287,8 +287,11 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       // ---- Load A from SLM into MMA registers ----
       // Each register position in coord_frag_A tells us the (m, k) coordinate
       // it maps to.  Read that element from the SLM scratch buffer.
+      // Note: use .tensor() to access the underlying Tensor base so that
+      // cute::size() template deduction succeeds (SubgroupTensor is a
+      // derived type that the free size() overload doesn't match directly).
       CUTE_UNROLL
-      for (int i = 0; i < size(tCrA); i++) {
+      for (int i = 0; i < size(tCrA.tensor()); i++) {
         int m_idx = static_cast<int>(get<0>(coord_frag_A(i)));
         int k_idx = static_cast<int>(get<1>(coord_frag_A(i)));
         tCrA(i) = slm_A[m_idx * K_TILE + k_idx];
