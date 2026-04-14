@@ -158,7 +158,10 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       make_shape(Int<TILE_M>{}, Int<K_TILE>{}));
   Tensor gA_id = local_tile(cA_id, select<0, 2>(wg_tile), make_coord(0, _));
   auto thr_mma = mma.get_slice(local_id);
-  auto coord_frag_A = thr_mma.partition_sg_fragment_A(gA_id(_, _, 0));
+  // Use partition_fragment_A (not partition_sg_fragment_A) so that the result
+  // is a plain Tensor of coordinate tuples.  This lets cute::size() and
+  // cute::get<> work correctly when we iterate over register positions below.
+  auto coord_frag_A = thr_mma.partition_fragment_A(gA_id(_, _, 0));
 
   // Create an SLM-backed tensor for A type and layout deduction.
   // partition_sg_fragment_A allocates new register storage; it does not read
@@ -287,11 +290,8 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       // ---- Load A from SLM into MMA registers ----
       // Each register position in coord_frag_A tells us the (m, k) coordinate
       // it maps to.  Read that element from the SLM scratch buffer.
-      // Note: use .tensor() to access the underlying Tensor base so that
-      // cute::size() template deduction succeeds (SubgroupTensor is a
-      // derived type that the free size() overload doesn't match directly).
       CUTE_UNROLL
-      for (int i = 0; i < size(tCrA.tensor()); i++) {
+      for (int i = 0; i < size(coord_frag_A); i++) {
         int m_idx = static_cast<int>(get<0>(coord_frag_A(i)));
         int k_idx = static_cast<int>(get<1>(coord_frag_A(i)));
         tCrA(i) = slm_A[m_idx * K_TILE + k_idx];
