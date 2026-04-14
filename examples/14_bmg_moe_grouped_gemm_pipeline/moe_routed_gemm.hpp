@@ -108,21 +108,24 @@ MoEGEMMRouted(const ElementA *HiddenStates,
               const int32_t tile_m,
               PersistentTileSchedulerSm90GroupParams<ProblemShape> scheduler_params) {
 
-  // K_TILE matches the K-dimension of the WG tile (third element of tile_mnk).
-  // For the 256×128×32 WG tile used here this is 32.
   constexpr int32_t K_TILE = 32;
 
-  // Compute workgroup linear ID for scratch buffer indexing
   uint64_t wg_linear_id = uint64_t(BlockIdxX()) +
-                           uint64_t(BlockIdxY()) * uint64_t(GridDimX()) +
-                           uint64_t(BlockIdxZ()) * uint64_t(GridDimX()) * uint64_t(GridDimY());
-  // Scratch is sized TILE_M × K_TILE per workgroup (not TILE_M × K).
+                          uint64_t(BlockIdxY()) * uint64_t(GridDimX()) +
+                          uint64_t(BlockIdxZ()) * uint64_t(GridDimX()) * uint64_t(GridDimY());
+
   int32_t scratch_stride = tile_m * K_TILE;
   ElementA *my_scratch = scratch_A + wg_linear_id * scratch_stride;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto local_id = static_cast<int32_t>(item.get_local_linear_id());
   auto local_size = static_cast<int32_t>(item.get_local_range().size());
+
+  auto sg = item.get_sub_group();
+  int32_t sg_lane = static_cast<int32_t>(sg.get_local_linear_id());
+  int32_t sg_size = static_cast<int32_t>(sg.get_local_range().size());
+  int32_t sg_id = local_id / sg_size;
+  int32_t num_sg = local_size / sg_size;
 
   TileScheduler scheduler{scheduler_params, const_cast<int32_t *>(M_per_group),
                           N, K, num_experts};
@@ -154,35 +157,28 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       did_group_change = false;
     }
 
-    // Compute tile boundaries
     int32_t m_start = m_coord * tile_m;
     int32_t tile_rows = M - m_start;
     if (tile_rows > tile_m) tile_rows = tile_m;
     int32_t k_tile_count = (K + K_TILE - 1) / K_TILE;
 
-    // ---- Set up CuTe tensors and GEMM infrastructure ----
-    // A surface: scratch buffer (tile_rows × K_TILE). Re-filled every K-iter.
     auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(
         my_scratch, tile_rows, K_TILE);
 
-    // B surface: expert weight matrix (N × K). Iterated over K.
     ElementB *ptr_B_curr =
         const_cast<ElementB *>(Weights) + curr_group * K * N;
     auto B_tensor = make_moe_tensor<ElementB, actual_layout_of_B>(
         ptr_B_curr, N, K);
 
-    // D surface: output tile (tile_rows × N)
     ElementD *ptr_D_tile = Outputs + (cumulative_M + m_start) * N;
     auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(
         ptr_D_tile, tile_rows, N);
 
-    // Coordinate / identity tensors
     Tensor cA = make_identity_tensor(A_tensor.shape());
     Tensor cB = make_identity_tensor(B_tensor.shape());
     Tensor cD = make_identity_tensor(D_tensor.shape());
 
     auto wg_tile = mma.tile_mnk(); // (256, 128, 32)
-    // m_coord=0 for A (scratch is already the M-tile)
     Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(0, _));
     Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(n_coord, _));
     auto wg_coord = make_coord(0, n_coord, 0);
@@ -190,7 +186,6 @@ MoEGEMMRouted(const ElementA *HiddenStates,
 
     auto thr_mma = mma.get_slice(local_id);
 
-    // 2D block copy objects
     auto tiled_copy_a = get_block_2d_copy_A<GmemTiledCopyA>(mma, A_tensor);
     auto tiled_copy_b = get_block_2d_copy_B<GmemTiledCopyB>(mma, B_tensor);
     auto tiled_copy_d = get_block_2d_copy_D<GmemTiledCopyD>(mma, D_tensor);
@@ -199,7 +194,6 @@ MoEGEMMRouted(const ElementA *HiddenStates,
     auto thr_copy_b = tiled_copy_b.get_slice(local_id);
     auto thr_copy_d = tiled_copy_d.get_slice(local_id);
 
-    // Register fragments
     auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
     auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
     auto tCrD = thr_mma.partition_sg_fragment_C(gD);
@@ -208,14 +202,10 @@ MoEGEMMRouted(const ElementA *HiddenStates,
     auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
 
-    // Source partitions:
-    //   tAgA has 1 K-tile (A surface is only K_TILE wide)
-    //   tBgB has k_tile_count K-tiles (B surface spans full K)
     Tensor tAgA = thr_copy_a.partition_S(gA);
     Tensor tBgB = thr_copy_b.partition_S(gB);
     auto tCgD = thr_copy_d.partition_D(gD);
 
-    // B prefetch (A is freshly written to scratch, likely cache-warm)
     auto prefetch_b = make_block_2d_prefetch(tiled_copy_b);
     auto thr_prefetch_B = prefetch_b.get_slice(local_id);
     auto pBgB = thr_prefetch_B.partition_S(gB);
@@ -223,7 +213,6 @@ MoEGEMMRouted(const ElementA *HiddenStates,
     constexpr int barrier_scope = 2;
     const int prefetch_dist = 3;
 
-    // Prefetch the first B K-tiles
     int prefetch_k = 0;
     CUTE_UNROLL
     for (; prefetch_k < prefetch_dist && prefetch_k < k_tile_count;
@@ -231,37 +220,35 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
     }
 
-    // ---- K-loop with interleaved K-sliced gather ----
     for (int k = 0; k < k_tile_count; k++, prefetch_k++) {
       int32_t k_offset = k * K_TILE;
       int32_t k_cols = K - k_offset;
       if (k_cols > K_TILE) k_cols = K_TILE;
 
-      // Cooperative gather of the K-slice from scattered hidden_states
-      // rows into the contiguous scratch buffer.
-      // K_TILE=32 is a power of 2 → row/col are cheap bit ops.
-      int32_t total_elems = tile_rows * k_cols;
-      for (int32_t e = local_id; e < total_elems; e += local_size) {
-        int32_t row = e >> 5;           // e / 32
-        int32_t col = e & (K_TILE - 1); // e % 32
-        int32_t orig_token =
-            sorted_token_ids[cumulative_M + m_start + row];
-        my_scratch[row * K_TILE + col] =
-            HiddenStates[orig_token * K + k_offset + col];
+      // Row-wise cooperative gather:
+      // one subgroup works on one row at a time so lanes read contiguous cols.
+      for (int32_t row = sg_id; row < tile_rows; row += num_sg) {
+        int32_t orig_token = sorted_token_ids[cumulative_M + m_start + row];
+        const ElementA *src = HiddenStates + orig_token * K + k_offset;
+        ElementA *dst = my_scratch + row * K_TILE;
+
+        for (int32_t col = sg_lane; col < k_cols; col += sg_size) {
+          dst[col] = src[col];
+        }
+
+        // Zero-fill tail for partial K tile.
+        for (int32_t col = k_cols + sg_lane; col < K_TILE; col += sg_size) {
+          dst[col] = ElementA(0);
+        }
       }
 
-      // Ensure all work-items have finished writing scratch before
-      // the 2D block loads read from it.
       item.barrier(sycl::access::fence_space::global_and_local);
 
       barrier_arrive(barrier_scope);
 
-      // 2D block load A from scratch (always k=0 in the A tensor)
       copy(tiled_copy_a, tAgA(_, _, _, 0), tArA);
-      // 2D block load B (k-th K-tile from expert weights)
       copy(tiled_copy_b, tBgB(_, _, _, k), tBrB);
 
-      // Prefetch next B K-tile
       if (prefetch_k < k_tile_count) {
         prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
       }
@@ -269,22 +256,19 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       reorder(tArA, tCrA);
       reorder(tBrB, tCrB);
 
-      // DPAS — accumulates into tCrD across K iterations
       cute::gemm(mma, tCrA, tCrB, tCrD);
 
-      // Named barrier: all subgroups done with 2D loads from scratch
-      // before next iteration overwrites it.
       barrier_wait(barrier_scope);
-    } // end K-loop
+    }
 
-    // Store accumulated result
     reorder(tCrD, tCrD_final);
     copy(tiled_copy_d, tCrD_final, tCgD);
 
-    // Get next work tile
     work_tile_info = scheduler.fetch_next_work(work_tile_info);
-    did_group_change = curr_group != work_tile_info.L_idx;
-  } // end while loop
+    did_group_change = work_tile_info.is_valid() &&
+                       (curr_group != work_tile_info.L_idx);
+  }
 }
 
 } // namespace MoE
+
