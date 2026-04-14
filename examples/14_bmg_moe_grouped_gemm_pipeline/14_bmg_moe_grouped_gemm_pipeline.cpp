@@ -42,11 +42,10 @@
       1. Build routing tables on host: sorted_token_ids (grouped by expert)
          and tokens_per_expert from topk_ids.
       2. Routed Grouped GEMM #1: hidden_states @ w13_weights^T
-         Uses SLM-staged K-sliced gather: the GEMM K-loop is inlined, and for
-         each K-tile (stride 32), only the needed TILE_M × 32 slice is gathered
-         from the scattered hidden_states rows into SLM, then loaded directly
-         into MMA registers (bypasses 2D block load and reorder for A).
-         B is loaded from global memory via 2D block load with prefetch.
+         Uses K-sliced gather: the GEMM K-loop is inlined, and for each K-tile
+         (stride 32), only the needed TILE_M × 32 slice is gathered from the
+         scattered hidden_states rows into a tiny per-workgroup scratch buffer,
+         followed by a 2D block load + DPAS accumulate. B prefetch is preserved.
          -> intermediate [total_routed_tokens, 2*intermediate_size]  (BF16 compute)
       3. SiLU-gating activation (FP32 compute): for each token row, split
          the 2*intermediate_size columns into gate (first half) and up (second half),
@@ -57,31 +56,19 @@
       5. Scatter-reduce (FP32 compute): accumulate expert outputs back into the
          original token order using sorted_token_ids, then cast to BF16
 
-    Design note — SLM-staged K-sliced gather in Grouped GEMM #1:
-      Both the A-matrix scratch buffer and sorted_token_ids are kept entirely
-      in Shared Local Memory (SLM), eliminating global scratch allocation:
-
-      Per M-tile: load sorted_token_ids for this tile → SLM (1 KB, once).
-      For each K-tile (32 columns):
-        1. Cooperative gather of TILE_M × 32 from scattered rows → SLM
-        2. Workgroup barrier (SLM fence)
-        3. Each subgroup loads A from SLM into MMA registers via identity-
-           tensor coordinate mapping (no 2D block load, no reorder).
-           B loaded via 2D block load from global memory.
-        4. DPAS accumulate. Workgroup barrier protects SLM.
-
-      SLM budget per workgroup:
-        A scratch:  256 × 32 × 2 = 16 KB
-        Token IDs:  256 × 4      =  1 KB
-        Total:      ~17 KB (well within 64 KB SLM limit)
-
-      Benefits:
-        - No global scratch allocation or parameter.
-        - Gather target is SLM (guaranteed low latency, no cache pollution).
-        - Token IDs loaded once per M-tile, reused across all K iterations
-          (saves ~23 K redundant global reads per workgroup per M-tile).
-        - A loaded from SLM directly into MMA registers — no 2D block load,
-          no reorder step.
+    Design note — K-sliced gather in Grouped GEMM #1:
+      Instead of gathering the full TILE_M × K block (e.g. 256 × 2880 ≈ 1.4 MB
+      per workgroup) before running the GEMM, the kernel interleaves the gather
+      with the GEMM's K-loop:
+        for each K-tile (32 columns):
+          1. Cooperative gather of TILE_M × 32 from scattered rows → scratch
+          2. Workgroup barrier
+          3. 2D block load A from scratch, 2D block load B from weights, DPAS
+          4. Named barrier
+      Scratch per workgroup: TILE_M × K_TILE × 2 = 16 KB (fits in L1).
+      Each gather reads one cache line per row per K-tile. Hidden-state rows
+      warm in cache across K iterations. K_TILE=32 (power of 2) makes the
+      row/col index computation a cheap shift + AND.
       SiLU and scatter-reduce steps use simple SYCL parallel_for kernels
       operating in registers.
 
@@ -334,6 +321,33 @@ template <class TA, class TB> auto choose_tiled_mma(TA * /*A*/, TB * /*B*/) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Compute the total number of workgroups the persistent tile scheduler will use.
+// This is needed to allocate the per-workgroup scratch buffer for the routed GEMM.
+int compute_total_workgroups() {
+  int sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  cutlass::KernelHardwareInfo hw_info{0, sm_count};
+  auto dummy_problem_shape = cute::Shape<int, int, int>{1, 1, 1};
+  auto dummy_group_problem_shape =
+      cutlass::gemm::GroupProblemShape<Shape<int, int, int>>{
+          1, &dummy_problem_shape, nullptr};
+  using TileShape = Shape<_256, _128, _32>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  auto scheduler_params =
+      PersistentTileSchedulerXeMoE<ProblemShape>::to_underlying_arguments(
+          dummy_group_problem_shape, TileShape{}, ClusterShape{}, hw_info,
+          PersistentTileSchedulerXeMoE<ProblemShape>::Arguments{
+              1, RasterOrderOptions::AlongN});
+  auto gd = PersistentTileSchedulerXeMoE<ProblemShape>::get_grid_shape(
+      scheduler_params, dummy_group_problem_shape, TileShape{}, ClusterShape{},
+      hw_info,
+      PersistentTileSchedulerXeMoE<ProblemShape>::Arguments{
+          1, RasterOrderOptions::AlongN});
+  return gd.x * gd.y * gd.z;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Launch a grouped GEMM using the MoE tile scheduler (same as example 12)
 template <char layoutA, char layoutB, typename ElementA, typename ElementB,
           typename ElementD, int GemmId>
@@ -402,11 +416,11 @@ void launch_grouped_gemm(const ElementA *activations, const ElementB *weights,
 
 // Launch a routed grouped GEMM for GEMM #1: gathers A-matrix rows from
 // hidden_states inside the kernel using sorted_token_ids.
-// A scratch and token ID cache are in SLM (no global scratch allocation needed).
 template <char layoutA, char layoutB, typename ElementA, typename ElementB,
           typename ElementD, int GemmId>
 void launch_routed_grouped_gemm(const ElementA *hidden_states,
                                 const int32_t *sorted_token_ids,
+                                ElementA *scratch_a,
                                 const ElementB *weights,
                                 ElementD *outputs,
                                 const int gemm_n, const int gemm_k,
@@ -464,7 +478,7 @@ void launch_routed_grouped_gemm(const ElementA *hidden_states,
                            XE_LOAD_2D_VNNI<16, 32, 16, 16>,
                            XE_STORE_2D<16, 8, 32>,
                            'R', 'R', 'R'>(
-            hidden_states, sorted_token_ids,
+            hidden_states, sorted_token_ids, scratch_a,
             weights, static_cast<void *>(nullptr), outputs, mma,
             num_rows_per_expert_device, num_experts,
             gemm_n, gemm_k, TILE_M, scheduler_params);
@@ -680,14 +694,19 @@ void run_moe_pipeline(const Options &options) {
 
   // ---- Allocate intermediate buffers ----
 
-  // Routed GEMM #1 uses SLM for the A scratch buffer and token ID cache.
-  // No global scratch allocation needed.
-  //   SLM per workgroup:
-  //     A scratch:  256 × 32 × 2 bytes = 16 KB
-  //     Token IDs:  256 × 4 bytes       =  1 KB
-  //     Total:      ~17 KB  (well within 64 KB SLM limit)
-  std::cout << "  SLM per WG       : ~17 KB (A scratch: 16 KB, token IDs: 1 KB)"
-            << std::endl;
+  // Per-workgroup scratch buffer for routed GEMM #1 (K-sliced gather).
+  // Each workgroup stages only TILE_M × K_TILE elements at a time
+  // (e.g. 256 × 32 × 2 bytes = 16 KB, fits in L1 cache).
+  constexpr int TILE_M = 256;
+  constexpr int K_TILE = 32;
+  int total_workgroups = compute_total_workgroups();
+  int64_t scratch_size =
+      static_cast<int64_t>(total_workgroups) * TILE_M * K_TILE;
+  cutlass::DeviceAllocation<cutlass::bfloat16_t> scratch_a;
+  scratch_a.reset(scratch_size);
+  std::cout << "  scratch buffer   : " << total_workgroups << " workgroups × "
+            << TILE_M << " × " << K_TILE << " = "
+            << (scratch_size * 2) / 1024 << " KB" << std::endl;
 
   // GEMM1 output: [total_routed_tokens, 2*intermediate_size]
   cutlass::DeviceAllocation<cutlass::bfloat16_t> gemm1_output;
@@ -709,43 +728,96 @@ void run_moe_pipeline(const Options &options) {
   cutlass::DeviceAllocation<cutlass::bfloat16_t> final_output;
   final_output.reset(num_tokens * hidden_dim);
 
+  for (int ii = 0; ii < 2; ++ii) {
+    // Step 1: Routed Grouped GEMM #1 - hidden_states @ w13_weights^T
+    //   K-sliced gather: the kernel fetches A-matrix rows directly from
+    //   hidden_states using sorted_token_ids, one K-tile (32 cols) at a time.
+    //   A: per-expert rows from hidden_states[sorted_token_ids[...], :hidden_dim]
+    //   B: w13_weights[e]: [hidden_dim, 2*intermediate_size]
+    //   D: gemm1_output: [total_routed_tokens, 2*intermediate_size] (contiguous per expert)
+    launch_routed_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
+                               cutlass::bfloat16_t, 1>(
+        hidden_states.get(), sorted_token_ids_device.get(), scratch_a.get(),
+        w13_weights.get(), gemm1_output.get(), inter2, hidden_dim,
+        tokens_per_expert_device.get(), num_experts);
+
+    // Step 2: SiLU gating activation (FP32 compute)
+    launch_silu_gating(gemm1_output.get(), silu_output.get(),
+                       total_routed_tokens, intermediate_size);
+
+    // Step 3: Grouped GEMM #2 - silu_output @ w2_weights^T
+    //   silu_output is already contiguous per expert, so standard grouped GEMM.
+    //   A: [tokens_per_expert[e], intermediate_size] for each expert
+    //   B: w2_weights[e]: [intermediate_size, hidden_dim]
+    //   D: gemm2_output[e]: [tokens_per_expert[e], hidden_dim]
+    launch_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
+                        cutlass::bfloat16_t, 2>(
+        silu_output.get(), w2_weights.get(), gemm2_output.get(), hidden_dim,
+        intermediate_size, tokens_per_expert_device.get(), num_experts);
+
+    // Step 4: Scatter-reduce (FP32 compute, cast to BF16)
+    launch_scatter_reduce(gemm2_output.get(), final_output.get(),
+                          reduce_buffer.get(), sorted_token_ids_device.get(),
+                          total_routed_tokens, num_tokens, hidden_dim);
+  }
+
   // ---- Run the pipeline ----
   GPU_Clock timer;
   timer.start();
 
-  // Step 1: Routed Grouped GEMM #1 - hidden_states @ w13_weights^T
-  //   SLM-staged K-sliced gather: the kernel gathers A-matrix rows from
-  //   hidden_states into SLM using SLM-cached sorted_token_ids, then loads
-  //   directly into MMA registers. No global scratch buffer needed.
-  //   A: per-expert rows from hidden_states[sorted_token_ids[...], :hidden_dim]
-  //   B: w13_weights[e]: [hidden_dim, 2*intermediate_size]
-  //   D: gemm1_output: [total_routed_tokens, 2*intermediate_size] (contiguous per expert)
-  launch_routed_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
-                             cutlass::bfloat16_t, 1>(
-      hidden_states.get(), sorted_token_ids_device.get(),
-      w13_weights.get(), gemm1_output.get(), inter2, hidden_dim,
-      tokens_per_expert_device.get(), num_experts);
+  GPU_Clock stage_timer;
 
-  // Step 2: SiLU gating activation (FP32 compute)
-  launch_silu_gating(gemm1_output.get(), silu_output.get(),
-                     total_routed_tokens, intermediate_size);
+  float routed_gemm_ms = 0.0f;
+  float silu_ms = 0.0f;
+  float grouped_gemm_ms = 0.0f;
+  float scatter_reduce_ms = 0.0f;
 
-  // Step 3: Grouped GEMM #2 - silu_output @ w2_weights^T
-  //   silu_output is already contiguous per expert, so standard grouped GEMM.
-  //   A: [tokens_per_expert[e], intermediate_size] for each expert
-  //   B: w2_weights[e]: [intermediate_size, hidden_dim]
-  //   D: gemm2_output[e]: [tokens_per_expert[e], hidden_dim]
-  launch_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
-                      cutlass::bfloat16_t, 2>(
-      silu_output.get(), w2_weights.get(), gemm2_output.get(), hidden_dim,
-      intermediate_size, tokens_per_expert_device.get(), num_experts);
+  for (int ii = 0; ii < 5; ++ii) {
+    // Step 1: Routed Grouped GEMM #1 - hidden_states @ w13_weights^T
+    //   K-sliced gather: the kernel fetches A-matrix rows directly from
+    //   hidden_states using sorted_token_ids, one K-tile (32 cols) at a time.
+    //   A: per-expert rows from hidden_states[sorted_token_ids[...], :hidden_dim]
+    //   B: w13_weights[e]: [hidden_dim, 2*intermediate_size]
+    //   D: gemm1_output: [total_routed_tokens, 2*intermediate_size] (contiguous per expert)
+    stage_timer.start();
+    launch_routed_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
+                               cutlass::bfloat16_t, 1>(
+        hidden_states.get(), sorted_token_ids_device.get(), scratch_a.get(),
+        w13_weights.get(), gemm1_output.get(), inter2, hidden_dim,
+        tokens_per_expert_device.get(), num_experts);
+    routed_gemm_ms = stage_timer.seconds() * 1000.0f;
+    std::cout << "  launch_routed_grouped_gemm : " << routed_gemm_ms << " ms\n";
 
-  // Step 4: Scatter-reduce (FP32 compute, cast to BF16)
-  launch_scatter_reduce(gemm2_output.get(), final_output.get(),
-                        reduce_buffer.get(), sorted_token_ids_device.get(),
-                        total_routed_tokens, num_tokens, hidden_dim);
+    // Step 2: SiLU gating activation (FP32 compute)
+    stage_timer.start();
+    launch_silu_gating(gemm1_output.get(), silu_output.get(),
+                       total_routed_tokens, intermediate_size);
+    silu_ms = stage_timer.seconds() * 1000.0f;
+    std::cout << "  launch_silu_gating         : " << silu_ms << " ms\n";
 
-  float pipeline_time_ms = timer.seconds() * 1000;
+    // Step 3: Grouped GEMM #2 - silu_output @ w2_weights^T
+    //   silu_output is already contiguous per expert, so standard grouped GEMM.
+    //   A: [tokens_per_expert[e], intermediate_size] for each expert
+    //   B: w2_weights[e]: [intermediate_size, hidden_dim]
+    //   D: gemm2_output[e]: [tokens_per_expert[e], hidden_dim]
+    stage_timer.start();
+    launch_grouped_gemm<'R', 'R', cutlass::bfloat16_t, cutlass::bfloat16_t,
+                        cutlass::bfloat16_t, 2>(
+        silu_output.get(), w2_weights.get(), gemm2_output.get(), hidden_dim,
+        intermediate_size, tokens_per_expert_device.get(), num_experts);
+    grouped_gemm_ms = stage_timer.seconds() * 1000.0f;
+    std::cout << "  launch_grouped_gemm        : " << grouped_gemm_ms << " ms\n";
+
+    // Step 4: Scatter-reduce (FP32 compute, cast to BF16)
+    stage_timer.start();
+    launch_scatter_reduce(gemm2_output.get(), final_output.get(),
+                          reduce_buffer.get(), sorted_token_ids_device.get(),
+                          total_routed_tokens, num_tokens, hidden_dim);
+    scatter_reduce_ms = stage_timer.seconds() * 1000.0f;
+    std::cout << "  launch_scatter_reduce      : " << scatter_reduce_ms << " ms\n";
+  }
+
+  float pipeline_time_ms = timer.seconds() * 1000 / 5.0;
   std::cout << "\n  Pipeline runtime : " << pipeline_time_ms << " ms"
             << std::endl;
 
