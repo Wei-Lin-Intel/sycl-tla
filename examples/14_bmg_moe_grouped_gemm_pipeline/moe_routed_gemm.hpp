@@ -47,44 +47,39 @@ using namespace cute;
 // from the original hidden_states buffer using an index array
 // (sorted_token_ids), avoiding a separate gather kernel.
 //
-// Design — K-sliced gather with SLM staging:
-//   Both the A-matrix scratch buffer and the sorted_token_ids index array
-//   are kept in Shared Local Memory (SLM) instead of global memory:
-//
-//   Per M-tile:
-//     Load sorted_token_ids for this tile → SLM (1 KB, once per M-tile).
+// Design — K-sliced gather:
+//   Instead of gathering the full TILE_M × K block before running the GEMM,
+//   this kernel interleaves the gather with the GEMM's K-loop:
 //
 //   for each K-tile (stride K_TILE = 32):
 //     1. Cooperative gather: each work-item loads its share of the
-//        TILE_M × K_TILE slice from scattered rows of HiddenStates into
-//        the SLM scratch buffer using SLM-cached token IDs.
-//     2. Workgroup barrier (SLM fence).
-//     3. Each subgroup loads its portion of the A-tile directly from SLM
-//        into MMA register fragments using the identity-tensor coordinate
-//        mapping (bypasses 2D block load and reorder). B is loaded from
-//        global memory via the standard 2D block load path.
-//     4. DPAS accumulate.
-//     5. Workgroup barrier protects SLM before the next iteration.
+//        TILE_M × K_TILE slice from scattered rows of HiddenStates into a
+//        per-workgroup scratch region (only TILE_M × K_TILE per workgroup).
+//     2. Workgroup barrier (memory fence).
+//     3. 2D block load the gathered A-tile from scratch, 2D block load the
+//        corresponding B K-tile from the expert weight matrix, DPAS
+//        accumulate.
+//     4. Named barrier ensures all subgroups are done reading scratch
+//        before the next iteration overwrites it.
 //
 //   After all K-tiles, the accumulated result is stored to the output.
 //
-// SLM budget:
-//   - A scratch:        TILE_M × K_TILE × sizeof(ElementA) = 256 × 32 × 2 = 16 KB
-//   - Token IDs:        TILE_M × sizeof(int32_t)           = 256 × 4     =  1 KB
-//   - Total per WG:     ~17 KB  (well within 64 KB SLM limit)
-//
-// Benefits:
-//   - No global scratch allocation or parameter — SLM is per-workgroup.
-//   - Gather target is SLM (guaranteed low latency, no cache pollution).
-//   - Token IDs loaded once per M-tile, reused across all K iterations
-//     (saves k_tile_count × tile_rows global reads ≈ 23 K reads/WG/tile).
-//   - A loaded from SLM directly into MMA registers — no 2D block load,
-//     no reorder step.
-//   - B-tile prefetching from global memory is preserved.
+// Benefits over full-tile gather:
+//   - Scratch per workgroup: TILE_M × K_TILE × sizeof(ElementA)
+//     (e.g. 256 × 32 × 2 = 16 KB, fits in L1) instead of TILE_M × K
+//     (e.g. 256 × 2880 × 2 ≈ 1.4 MB, thrashes caches).
+//   - The gather per K-tile is 32 columns at a time — a single cache line
+//     read per row — giving much better memory access efficiency.
+//   - K_TILE=32 is a power of 2, so row/col from a linear index are cheap
+//     bitwise operations (shift + AND) instead of expensive integer division.
+//   - B-tile prefetching is preserved across K iterations.
+//   - Hidden-state rows partially warm in cache across K iterations since
+//     the same set of rows (same M-tile) is accessed with advancing columns.
 //
 // Parameters:
 //   HiddenStates      - [num_tokens, K] original activation matrix (not reordered)
 //   sorted_token_ids  - [total_routed_tokens] original token indices, grouped by expert
+//   scratch_A         - pre-allocated global scratch, sized total_workgroups * TILE_M * K_TILE
 //   Weights           - [num_experts * K * N] weight matrices
 //   Scales            - unused (pass nullptr)
 //   Outputs           - [total_routed_tokens * N] output buffer (contiguous per expert)
@@ -102,6 +97,7 @@ template <class GmemTiledCopyA, class GmemTiledCopyB, class GmemTiledCopyD,
 CUTE_DEVICE void
 MoEGEMMRouted(const ElementA *HiddenStates,
               const int32_t *sorted_token_ids,
+              ElementA *scratch_A,
               const ElementB *Weights,
               const ElementS *Scales,
               ElementD *Outputs,
@@ -112,15 +108,14 @@ MoEGEMMRouted(const ElementA *HiddenStates,
               const int32_t tile_m,
               PersistentTileSchedulerSm90GroupParams<ProblemShape> scheduler_params) {
 
-  // Compile-time tile dimensions (must match WG tile)
-  constexpr int32_t TILE_M = 256;
   constexpr int32_t K_TILE = 32;
 
-  // ---- SLM allocations ----
-  // A scratch: TILE_M × K_TILE BF16 = 16 KB
-  auto *slm_A = compat::local_mem<ElementA[TILE_M * K_TILE]>();
-  // Token ID cache: TILE_M int32 = 1 KB
-  auto *slm_ids = compat::local_mem<int32_t[TILE_M]>();
+  uint64_t wg_linear_id = uint64_t(BlockIdxX()) +
+                          uint64_t(BlockIdxY()) * uint64_t(GridDimX()) +
+                          uint64_t(BlockIdxZ()) * uint64_t(GridDimX()) * uint64_t(GridDimY());
+
+  int32_t scratch_stride = tile_m * K_TILE;
+  ElementA *my_scratch = scratch_A + wg_linear_id * scratch_stride;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto local_id = static_cast<int32_t>(item.get_local_linear_id());
@@ -148,33 +143,6 @@ MoEGEMMRouted(const ElementA *HiddenStates,
     M = M_per_group[curr_group];
   }
 
-  // ---- Pre-compute coordinate mapping for A ----
-  // The identity tensor + MMA partitioning tells us which (m, k) coordinate
-  // each register position in the MMA A-fragment corresponds to. This mapping
-  // is compile-time constant (depends only on the WG tile and MMA layout) and
-  // is reused across all M-tiles and K iterations.
-  auto wg_tile = mma.tile_mnk(); // (256, 128, 32)
-  Tensor cA_id = make_identity_tensor(
-      make_shape(Int<TILE_M>{}, Int<K_TILE>{}));
-  Tensor gA_id = local_tile(cA_id, select<0, 2>(wg_tile), make_coord(0, _));
-  auto thr_mma = mma.get_slice(local_id);
-  // Use partition_A (not partition_fragment_A or partition_sg_fragment_A).
-  // partition_A preserves the original coordinate-tuple data from the identity
-  // tensor, so cute::get<0>/get<1> work when we extract (m,k) indices below.
-  // partition_fragment_A would allocate new FrgTypeA storage, losing coordinates.
-  auto coord_frag_A = thr_mma.partition_A(gA_id(_, _, 0));
-
-  // Create an SLM-backed tensor for A type and layout deduction.
-  // partition_sg_fragment_A allocates new register storage; it does not read
-  // from SLM here.  The tensor's shape and element type propagate into the
-  // MMA fragment so that cute::gemm receives a properly-typed subgroup tensor.
-  auto sA_tensor = make_tensor(
-      make_smem_ptr(slm_A),
-      make_layout(make_shape(Int<TILE_M>{}, Int<K_TILE>{}),
-                  make_stride(Int<K_TILE>{}, _1{})));
-  Tensor gA_typed = local_tile(sA_tensor, select<0, 2>(wg_tile),
-                               make_coord(0, _));
-
   while (work_tile_info.is_valid()) {
     auto m_coord = work_tile_info.M_idx;
     auto n_coord = work_tile_info.N_idx;
@@ -194,19 +162,9 @@ MoEGEMMRouted(const ElementA *HiddenStates,
     if (tile_rows > tile_m) tile_rows = tile_m;
     int32_t k_tile_count = (K + K_TILE - 1) / K_TILE;
 
-    // ---- Load sorted_token_ids for this M-tile into SLM ----
-    // Loaded once per M-tile, reused across all K iterations.
-    for (int32_t i = local_id; i < TILE_M; i += local_size) {
-      if (i < tile_rows) {
-        slm_ids[i] = sorted_token_ids[cumulative_M + m_start + i];
-      } else {
-        slm_ids[i] = 0; // out-of-range rows; gather will produce 0
-      }
-    }
-    // SLM-only barrier: token IDs written to SLM; no global writes to fence.
-    item.barrier(sycl::access::fence_space::local_space);
+    auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(
+        my_scratch, tile_rows, K_TILE);
 
-    // ---- B and D tensors (unchanged — global memory) ----
     ElementB *ptr_B_curr =
         const_cast<ElementB *>(Weights) + curr_group * K * N;
     auto B_tensor = make_moe_tensor<ElementB, actual_layout_of_B>(
@@ -216,32 +174,38 @@ MoEGEMMRouted(const ElementA *HiddenStates,
     auto D_tensor = make_moe_tensor<ElementD, LayoutKindD>(
         ptr_D_tile, tile_rows, N);
 
+    Tensor cA = make_identity_tensor(A_tensor.shape());
     Tensor cB = make_identity_tensor(B_tensor.shape());
     Tensor cD = make_identity_tensor(D_tensor.shape());
 
+    auto wg_tile = mma.tile_mnk(); // (256, 128, 32)
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(0, _));
     Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(n_coord, _));
     auto wg_coord = make_coord(0, n_coord, 0);
     Tensor gD = local_tile(cD, wg_tile, wg_coord, Step<_1, _1, X>{});
 
+    auto thr_mma = mma.get_slice(local_id);
+
+    auto tiled_copy_a = get_block_2d_copy_A<GmemTiledCopyA>(mma, A_tensor);
     auto tiled_copy_b = get_block_2d_copy_B<GmemTiledCopyB>(mma, B_tensor);
     auto tiled_copy_d = get_block_2d_copy_D<GmemTiledCopyD>(mma, D_tensor);
 
+    auto thr_copy_a = tiled_copy_a.get_slice(local_id);
     auto thr_copy_b = tiled_copy_b.get_slice(local_id);
     auto thr_copy_d = tiled_copy_d.get_slice(local_id);
 
-    // MMA register fragments
-    auto tCrA = thr_mma.partition_sg_fragment_A(gA_typed(_, _, 0));
+    auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
     auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
     auto tCrD = thr_mma.partition_sg_fragment_C(gD);
     auto tCrD_final = thr_copy_d.partition_sg_fragment_S(gD);
 
-    // B copy fragments (A loaded from SLM, no copy fragment needed)
+    auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
 
+    Tensor tAgA = thr_copy_a.partition_S(gA);
     Tensor tBgB = thr_copy_b.partition_S(gB);
     auto tCgD = thr_copy_d.partition_D(gD);
 
-    // B prefetch (A is in SLM — no prefetch needed)
     auto prefetch_b = make_block_2d_prefetch(tiled_copy_b);
     auto thr_prefetch_B = prefetch_b.get_slice(local_id);
     auto pBgB = thr_prefetch_B.partition_S(gB);
@@ -256,30 +220,24 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
     }
 
-    // ---- K-loop with SLM-staged A gather ----
     for (int k = 0; k < k_tile_count; k++, prefetch_k++) {
       int32_t k_offset = k * K_TILE;
       int32_t k_cols = K - k_offset;
       if (k_cols > K_TILE) k_cols = K_TILE;
 
-      // Cooperative gather into SLM using SLM-cached token IDs.
-      // One subgroup works on one row at a time; lanes read contiguous cols.
+      // Row-wise cooperative gather:
+      // one subgroup works on one row at a time so lanes read contiguous cols.
       for (int32_t row = sg_id; row < tile_rows; row += num_sg) {
-        int32_t orig_token = slm_ids[row];
+        int32_t orig_token = sorted_token_ids[cumulative_M + m_start + row];
         const ElementA *src = HiddenStates + orig_token * K + k_offset;
-        ElementA *dst = slm_A + row * K_TILE;
+        ElementA *dst = my_scratch + row * K_TILE;
 
         for (int32_t col = sg_lane; col < k_cols; col += sg_size) {
           dst[col] = src[col];
         }
+
+        // Zero-fill tail for partial K tile.
         for (int32_t col = k_cols + sg_lane; col < K_TILE; col += sg_size) {
-          dst[col] = ElementA(0);
-        }
-      }
-      // Zero-fill rows beyond tile_rows (so out-of-range MMA reads get 0).
-      for (int32_t row = tile_rows + sg_id; row < TILE_M; row += num_sg) {
-        ElementA *dst = slm_A + row * K_TILE;
-        for (int32_t col = sg_lane; col < K_TILE; col += sg_size) {
           dst[col] = ElementA(0);
         }
       }
@@ -288,24 +246,14 @@ MoEGEMMRouted(const ElementA *HiddenStates,
 
       barrier_arrive(barrier_scope);
 
-      // ---- Load A from SLM into MMA registers ----
-      // Each register position in coord_frag_A tells us the (m, k) coordinate
-      // it maps to.  Read that element from the SLM scratch buffer.
-      CUTE_UNROLL
-      for (int i = 0; i < size(coord_frag_A); i++) {
-        int m_idx = static_cast<int>(get<0>(coord_frag_A(i)));
-        int k_idx = static_cast<int>(get<1>(coord_frag_A(i)));
-        tCrA(i) = slm_A[m_idx * K_TILE + k_idx];
-      }
-
-      // Load B via 2D block load (unchanged)
+      copy(tiled_copy_a, tAgA(_, _, _, 0), tArA);
       copy(tiled_copy_b, tBgB(_, _, _, k), tBrB);
 
       if (prefetch_k < k_tile_count) {
         prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
       }
 
-      // No reorder for A — already in MMA register layout.
+      reorder(tArA, tCrA);
       reorder(tBrB, tCrB);
 
       cute::gemm(mma, tCrA, tCrB, tCrD);
