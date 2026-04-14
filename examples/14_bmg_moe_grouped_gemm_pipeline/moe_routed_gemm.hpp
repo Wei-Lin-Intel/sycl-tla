@@ -160,9 +160,10 @@ MoEGEMMRouted(const ElementA *HiddenStates,
   auto thr_mma = mma.get_slice(local_id);
   auto coord_frag_A = thr_mma.partition_sg_fragment_A(gA_id(_, _, 0));
 
-  // Create a properly-typed A data fragment (subgroup tensor, ElementA).
-  // We use an SLM-backed tensor for type deduction only — partition_sg_fragment_A
-  // allocates new register storage; it does not read from SLM here.
+  // Create an SLM-backed tensor for A type and layout deduction.
+  // partition_sg_fragment_A allocates new register storage; it does not read
+  // from SLM here.  The tensor's shape and element type propagate into the
+  // MMA fragment so that cute::gemm receives a properly-typed subgroup tensor.
   auto sA_tensor = make_tensor(
       make_smem_ptr(slm_A),
       make_layout(make_shape(Int<TILE_M>{}, Int<K_TILE>{}),
@@ -198,7 +199,8 @@ MoEGEMMRouted(const ElementA *HiddenStates,
         slm_ids[i] = 0; // out-of-range rows; gather will produce 0
       }
     }
-    item.barrier(sycl::access::fence_space::global_and_local);
+    // SLM-only barrier: token IDs written to SLM; no global writes to fence.
+    item.barrier(sycl::access::fence_space::local_space);
 
     // ---- B and D tensors (unchanged — global memory) ----
     ElementB *ptr_B_curr =
