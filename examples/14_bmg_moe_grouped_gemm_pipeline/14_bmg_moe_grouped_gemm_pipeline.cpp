@@ -42,9 +42,10 @@
       1. Build routing tables on host: sorted_token_ids (grouped by expert)
          and tokens_per_expert from topk_ids.
       2. Routed Grouped GEMM #1: hidden_states @ w13_weights^T
-         Each workgroup gathers the needed A-matrix rows from the original
-         hidden_states into a per-workgroup scratch buffer using
-         sorted_token_ids, then runs the standard GEMM tile on the staged data.
+         Uses K-sliced gather: the GEMM K-loop is inlined, and for each K-tile
+         (stride 32), only the needed TILE_M × 32 slice is gathered from the
+         scattered hidden_states rows into a tiny per-workgroup scratch buffer,
+         followed by a 2D block load + DPAS accumulate. B prefetch is preserved.
          -> intermediate [total_routed_tokens, 2*intermediate_size]  (BF16 compute)
       3. SiLU-gating activation (FP32 compute): for each token row, split
          the 2*intermediate_size columns into gate (first half) and up (second half),
@@ -55,19 +56,19 @@
       5. Scatter-reduce (FP32 compute): accumulate expert outputs back into the
          original token order using sorted_token_ids, then cast to BF16
 
-    Design note on SLM vs registers for the routed gather:
-      The per-tile gather in Grouped GEMM #1 stages A-tile rows into a
-      per-workgroup scratch region in global memory (not SLM). Each workgroup
-      cooperatively loads its needed rows from the scattered hidden_states via
-      sorted_token_ids, places them contiguously in the scratch buffer, then the
-      standard moe_gemm inner loop operates on the scratch buffer using 2D block
-      loads. Global memory staging was chosen over SLM because:
-        - A single K-tile slice of the M-tile fits in SLM (~16 KB), but the
-          full M-tile × K data for the 2D block copy surface descriptor needs
-          to be contiguous; staging into global memory lets the existing 2D
-          copy infrastructure work unchanged.
-        - The gather is cooperative across the workgroup and overlaps well
-          with the persistent scheduler's work distribution.
+    Design note — K-sliced gather in Grouped GEMM #1:
+      Instead of gathering the full TILE_M × K block (e.g. 256 × 2880 ≈ 1.4 MB
+      per workgroup) before running the GEMM, the kernel interleaves the gather
+      with the GEMM's K-loop:
+        for each K-tile (32 columns):
+          1. Cooperative gather of TILE_M × 32 from scattered rows → scratch
+          2. Workgroup barrier
+          3. 2D block load A from scratch, 2D block load B from weights, DPAS
+          4. Named barrier
+      Scratch per workgroup: TILE_M × K_TILE × 2 = 16 KB (fits in L1).
+      Each gather reads one cache line per row per K-tile. Hidden-state rows
+      warm in cache across K iterations. K_TILE=32 (power of 2) makes the
+      row/col index computation a cheap shift + AND.
       SiLU and scatter-reduce steps use simple SYCL parallel_for kernels
       operating in registers.
 
@@ -693,17 +694,19 @@ void run_moe_pipeline(const Options &options) {
 
   // ---- Allocate intermediate buffers ----
 
-  // Per-workgroup scratch buffer for routed GEMM #1.
-  // Each workgroup stages its A-tile (TILE_M rows × hidden_dim cols) here.
+  // Per-workgroup scratch buffer for routed GEMM #1 (K-sliced gather).
+  // Each workgroup stages only TILE_M × K_TILE elements at a time
+  // (e.g. 256 × 32 × 2 bytes = 16 KB, fits in L1 cache).
   constexpr int TILE_M = 256;
+  constexpr int K_TILE = 32;
   int total_workgroups = compute_total_workgroups();
   int64_t scratch_size =
-      static_cast<int64_t>(total_workgroups) * TILE_M * hidden_dim;
+      static_cast<int64_t>(total_workgroups) * TILE_M * K_TILE;
   cutlass::DeviceAllocation<cutlass::bfloat16_t> scratch_a;
   scratch_a.reset(scratch_size);
   std::cout << "  scratch buffer   : " << total_workgroups << " workgroups × "
-            << TILE_M << " × " << hidden_dim << " = "
-            << (scratch_size * 2) / (1024 * 1024) << " MB" << std::endl;
+            << TILE_M << " × " << K_TILE << " = "
+            << (scratch_size * 2) / 1024 << " KB" << std::endl;
 
   // GEMM1 output: [total_routed_tokens, 2*intermediate_size]
   cutlass::DeviceAllocation<cutlass::bfloat16_t> gemm1_output;
@@ -730,8 +733,8 @@ void run_moe_pipeline(const Options &options) {
   timer.start();
 
   // Step 1: Routed Grouped GEMM #1 - hidden_states @ w13_weights^T
-  //   The kernel fetches A-matrix rows directly from hidden_states using
-  //   sorted_token_ids (no separate gather step).
+  //   K-sliced gather: the kernel fetches A-matrix rows directly from
+  //   hidden_states using sorted_token_ids, one K-tile (32 cols) at a time.
   //   A: per-expert rows from hidden_states[sorted_token_ids[...], :hidden_dim]
   //   B: w13_weights[e]: [hidden_dim, 2*intermediate_size]
   //   D: gemm1_output: [total_routed_tokens, 2*intermediate_size] (contiguous per expert)
