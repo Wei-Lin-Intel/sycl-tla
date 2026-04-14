@@ -73,8 +73,6 @@
       --verify=<int>              Enable verification (0=no, 1=yes, default: 1)
 */
 
-#include "cutlass/util/GPU_Clock.hpp"
-
 #include <cute/tensor.hpp>
 #include <numeric>
 #include <random>
@@ -82,8 +80,6 @@
 #include <cute/util/compat.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
-
-#include <cute/tensor.hpp>
 
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
