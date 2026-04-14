@@ -259,6 +259,7 @@ void apply_silu(sycl::queue&        q,
         int feat = i % intermediate_size;
         float gate    = static_cast<float>(intermediate13[pos * two_is + feat]);
         float up      = static_cast<float>(intermediate13[pos * two_is + intermediate_size + feat]);
+        // sycl::exp is the native SYCL math function, auto-vectorised by the compiler.
         float gate_sig = gate / (1.0f + sycl::exp(-gate));
         silu_out[i]   = static_cast<ElementInter>(gate_sig * up);
       }).wait();
@@ -359,7 +360,7 @@ void launch_grouped_gemm(sycl::queue&      q,
 
   auto event = q.parallel_for<MoENoReorderGemmName<GemmId, ElementA, ElementB>>(
       sycl::nd_range<3>(global, local), kernel_props,
-      [=](auto) {
+      [=]([[maybe_unused]] auto nd_item) {
         MoE::MoEGEMM<XE_LOAD_2D<16, 32, 32, 16>,
                      XE_LOAD_2D_VNNI<16, 32, 16, 16>,
                      XE_STORE_2D<16, 8, 32>,
@@ -678,8 +679,10 @@ struct MoENoReorderRunner {
           }).wait();
     }
 
-    // Compare kernel output against reference
-    // Use relative tolerance appropriate for BF16 arithmetic differences
+    // Compare kernel output against reference.
+    // BF16 machine epsilon is ~0.0078 (2^-7).  A relative tolerance of 1% (0.01)
+    // accommodates the different summation order between the DPAS-based kernel and
+    // the sequential GemmComplex reference while rejecting clearly wrong results.
     const ElementOut epsilon       = ElementOut(0.01f);
     const ElementOut nonzero_floor = ElementOut(1e-4f);
     bool passed = cutlass::reference::device::BlockCompareRelativelyEqual(
