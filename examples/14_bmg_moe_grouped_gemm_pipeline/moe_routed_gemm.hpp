@@ -158,10 +158,11 @@ MoEGEMMRouted(const ElementA *HiddenStates,
       make_shape(Int<TILE_M>{}, Int<K_TILE>{}));
   Tensor gA_id = local_tile(cA_id, select<0, 2>(wg_tile), make_coord(0, _));
   auto thr_mma = mma.get_slice(local_id);
-  // Use partition_fragment_A (not partition_sg_fragment_A) so that the result
-  // is a plain Tensor of coordinate tuples.  This lets cute::size() and
-  // cute::get<> work correctly when we iterate over register positions below.
-  auto coord_frag_A = thr_mma.partition_fragment_A(gA_id(_, _, 0));
+  // Use partition_A (not partition_fragment_A or partition_sg_fragment_A).
+  // partition_A preserves the original coordinate-tuple data from the identity
+  // tensor, so cute::get<0>/get<1> work when we extract (m,k) indices below.
+  // partition_fragment_A would allocate new FrgTypeA storage, losing coordinates.
+  auto coord_frag_A = thr_mma.partition_A(gA_id(_, _, 0));
 
   // Create an SLM-backed tensor for A type and layout deduction.
   // partition_sg_fragment_A allocates new register storage; it does not read
