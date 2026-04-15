@@ -107,6 +107,7 @@ struct BlockDesc {
 inline void pipeline_body_pseudocode(int k_start, int k_end) {
 
   // -- Fragment storage (in real code: declared in register file) ----------
+  constexpr int Stages = 2;  // template parameter; number of prefetch stages
   FragS    S[2] = {};      // 2-slot QK accumulator
   FragAforP P[2] = {};     // 2-slot reordered-P
   FragSRow max_state = {}; // running row-wise maximum
@@ -128,7 +129,7 @@ inline void pipeline_body_pseudocode(int k_start, int k_end) {
     // barrier_arrive(WG)              -- ensure prefetched K data is visible
     BlockDesc d0 = make_block_desc(k_start);
     compute_qk(d0, S[0]);            // XMX: QK(k_start) → S[0]
-    prefetch_k(k_start + /*Stages=*/1);  // prefetch K for future blocks
+    prefetch_k(k_start + Stages);     // prefetch K for future blocks
     // barrier_wait(WG)
   }
 
@@ -170,7 +171,7 @@ inline void pipeline_body_pseudocode(int k_start, int k_end) {
     // Iteration k computes QK(k+1), so iteration k+Stages will compute
     // QK(k+Stages+1).  Combined with the prologue's K(k_start+Stages)
     // prefetch, every block gets exactly Stages iterations of lead time.
-    prefetch_k(k + /*Stages=*/1 + 1);
+    prefetch_k(k + Stages + 1);
 
     // barrier_wait(WG)
   }
