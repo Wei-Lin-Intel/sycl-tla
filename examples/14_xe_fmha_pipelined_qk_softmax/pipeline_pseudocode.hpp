@@ -119,11 +119,16 @@ inline void pipeline_body_pseudocode(int k_start, int k_end) {
   // ========================================================================
   // Prologue: compute QK for the first block into slot 0.
   // No overlap possible here (no previous block's softmax to overlap with).
+  //
+  // Also issue the K prefetch that the original serial loop would have
+  // performed at block k_start: K(k_start + Stages).  This ensures the
+  // steady-state's first few iterations do not miss the prefetch window.
   // ========================================================================
   {
     // barrier_arrive(WG)              -- ensure prefetched K data is visible
     BlockDesc d0 = make_block_desc(k_start);
     compute_qk(d0, S[0]);            // XMX: QK(k_start) → S[0]
+    prefetch_k(k_start + /*Stages=*/1);  // prefetch K for future blocks
     // barrier_wait(WG)
   }
 
@@ -161,7 +166,10 @@ inline void pipeline_body_pseudocode(int k_start, int k_end) {
     // This follows softmax to avoid competing for XMX with QK(next) above.
     accumulate_pv(cur_desc, P[cur], rescale, k == k_start, A_out);
 
-    // Prefetch K tile for k + Stages + 1 (non-faulting hint)
+    // Prefetch K for the block consumed Stages iterations from now.
+    // Iteration k computes QK(k+1), so iteration k+Stages will compute
+    // QK(k+Stages+1).  Combined with the prologue's K(k_start+Stages)
+    // prefetch, every block gets exactly Stages iterations of lead time.
     prefetch_k(k + /*Stages=*/1 + 1);
 
     // barrier_wait(WG)

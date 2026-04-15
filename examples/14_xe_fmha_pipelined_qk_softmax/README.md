@@ -29,6 +29,7 @@ for k in [k_start, k_end):
 ```
 Prologue:
     QK(k_start) → S_pipe[0]              [XMX]
+    prefetch K(k_start + Stages)          [prefetch, maintains lead time]
 
 Steady-state  k = k_start .. k_end-2:
     cur_slot  = (k - k_start) & 1
@@ -38,6 +39,7 @@ Steady-state  k = k_start .. k_end-2:
     mask(k)    on S_pipe[cur_slot]        [scalar] ← targets XVX; overlaps XMX above
     softmax(k) on S_pipe[cur_slot]        [XVX]   ←      "
     PV(k)  using P_pipe[cur_slot]         [XMX]   ← after softmax; avoids dual-XMX
+    prefetch K(k+1+Stages)               [prefetch]
 
 Epilogue:
     mask(last) + softmax(last) + PV(last) [no next-QK]
@@ -47,6 +49,21 @@ The critical reordering is: issue **QK(next)** first, then run **softmax(cur)**.
 The compiler/hardware has a window to overlap XMX (DPAS) and XVX (vector ALU)
 when the two instruction streams access disjoint registers (`S_pipe[next_slot]`
 vs `S_pipe[cur_slot]`).
+
+## K prefetch schedule
+
+The original serial loop prefetches K(K+Stages) at each block K, giving Stages
+iterations of lead time before the prefetched data is consumed.  In the pipelined
+version:
+
+- **Initial prefetch** (before the loop): K(0) .. K(Stages-1)
+- **Prologue**: prefetches K(k_start + Stages) — replaces what block k_start
+  would have done in the original serial loop
+- **Steady-state iteration k**: prefetches K(k + 1 + Stages) — replaces what
+  block k+1 would have done (since QK(k+1) is computed in this iteration)
+
+This ensures every K-block has exactly Stages iterations of lead time between
+prefetch issue and consumption, matching the original schedule.
 
 ## Key data structures
 

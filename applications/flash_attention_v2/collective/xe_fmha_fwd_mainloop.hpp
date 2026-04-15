@@ -386,32 +386,28 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     // *different* pipeline slot immediately afterwards.
     auto compute_qk_block = [&](BlockDesc const& desc, FragS& tSrS_dst) {
       clear(tSrS_dst);
+      // Select the K copy engine and tensor based on cache vs. non-cache.
+      // The inner D-loop and DPAS call are identical for both paths; only
+      // the copy source differs.
+      auto qk_inner = [&](auto& copy_k_sel, auto& tKgK_sel,
+                          auto& prefetch_v_sel, auto& pVgV_sel) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(tKgK); D++) {
+          copy(copy_q, tQgQ(_,_,_,D), tQrQ);
+          copy(copy_k_sel, tKgK_sel(_,_,_,desc.physical_k,D), tKrK);
+          reorder(tQrQ, tSrQ);
+          reorder(tKrK, tSrK);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS_dst);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v_sel, pVgV_sel(_,_,_,VV,desc.physical_k));
+        }
+      };
       if (desc.is_cache) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int D = 0; D < size<4>(tKgK); D++) {
-          copy(copy_q,       tQgQ(_,_,_,D),                  tQrQ);
-          copy(copy_k_cache, tKgK_cache(_,_,_,desc.physical_k,D), tKrK);
-          reorder(tQrQ, tSrQ);
-          reorder(tKrK, tSrK);
-          cute::gemm(mma_qk, tSrQ, tSrK, tSrS_dst);
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          prefetch(prefetch_v_cache, pVgV_cache(_,_,_,VV,desc.physical_k));
-        }
+        qk_inner(copy_k_cache, tKgK_cache, prefetch_v_cache, pVgV_cache);
       } else {
-        CUTLASS_PRAGMA_UNROLL
-        for (int D = 0; D < size<4>(tKgK); D++) {
-          copy(copy_q, tQgQ(_,_,_,D),              tQrQ);
-          copy(copy_k, tKgK(_,_,_,desc.physical_k,D), tKrK);
-          reorder(tQrQ, tSrQ);
-          reorder(tKrK, tSrK);
-          cute::gemm(mma_qk, tSrQ, tSrK, tSrS_dst);
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          prefetch(prefetch_v, pVgV(_,_,_,VV,desc.physical_k));
-        }
+        qk_inner(copy_k, tKgK, prefetch_v, pVgV);
       }
     };
 
@@ -477,30 +473,25 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
                                    FragAforP   const& tArP_slot,
                                    FragSRow    const& rescale,
                                    bool               first_block) {
+      // Select the V copy engine and tensor; the PV accumulate loop is
+      // identical for both cache and non-cache paths.
+      auto pv_inner = [&](auto& copy_v_sel, auto& tVgV_sel) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v_sel, tVgV_sel(_,_,_,VV,desc.physical_k), tVrV);
+          reorder(tVrV, tArV);
+          if (!first_block) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++)
+              tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
+          }
+          cute::gemm(mma_pv, tArP_slot, tArV, tArA(_,_,_,VV));
+        }
+      };
       if (desc.is_cache) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          copy(copy_v_cache, tVgV_cache(_,_,_,VV,desc.physical_k), tVrV);
-          reorder(tVrV, tArV);
-          if (!first_block) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tArA.size() / VTiles; i++)
-              tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
-          }
-          cute::gemm(mma_pv, tArP_slot, tArV, tArA(_,_,_,VV));
-        }
+        pv_inner(copy_v_cache, tVgV_cache);
       } else {
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          copy(copy_v, tVgV(_,_,_,VV,desc.physical_k), tVrV);
-          reorder(tVrV, tArV);
-          if (!first_block) {
-            CUTLASS_PRAGMA_UNROLL
-            for (int i = 0; i < tArA.size() / VTiles; i++)
-              tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
-          }
-          cute::gemm(mma_pv, tArP_slot, tArV, tArA(_,_,_,VV));
-        }
+        pv_inner(copy_v, tVgV);
       }
     };
 
@@ -537,10 +528,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
 
     // ------------------------------------------------------------------
     // Prologue: compute QK for the first block into pipeline slot 0.
+    // Also issue the K prefetch that the original serial loop would have
+    // performed at block k_start (i.e. K(k_start + Stages)).  Without
+    // this, the first `Stages` blocks of the steady-state would miss
+    // the prefetch window and hit cold cache lines.
     // ------------------------------------------------------------------
     {
       barrier_arrive(ScopeWorkgroup);
       compute_qk_block(make_block_desc(k_start), tSrS_pipe[0]);
+      prefetch_k_block(k_start + Stages);
       barrier_wait(ScopeWorkgroup);
     }
 
@@ -549,6 +545,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     //   [XMX]        QK(k+1)     -> tSrS_pipe[next_slot]
     //   [XVX/scalar] softmax(k)  on tSrS_pipe[cur_slot]   (targets XVX; can overlap XMX above)
     //   [XMX]        PV(k)       using tArP_pipe[cur_slot] (after softmax; separate XMX phase)
+    //
+    // K prefetch schedule: at iteration k we prefetch K(k+1+Stages) for
+    // future iterations.  Combined with the prologue's K(k_start+Stages)
+    // prefetch, every block has exactly `Stages` iterations of lead time
+    // between prefetch and consumption — matching the original serial
+    // code's schedule.
     // ------------------------------------------------------------------
     for (int k = k_start; k < k_end - 1; k++) {
       const int cur_slot  = (k - k_start) & 1;
@@ -575,7 +577,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       // Kept after the softmax window to avoid two concurrent XMX streams.
       accumulate_pv_block(cur_desc, tArP_pipe[cur_slot], rescale, k == k_start);
 
-      // Prefetch K for Stages iterations ahead of the next block
+      // Prefetch K for the block that will be consumed Stages iterations
+      // from now.  Iteration k computes QK(k+1), so Stages iterations
+      // later (iteration k+Stages) will compute QK(k+Stages+1).
       prefetch_k_block(k + Stages + 1);
 
       barrier_wait(ScopeWorkgroup);
