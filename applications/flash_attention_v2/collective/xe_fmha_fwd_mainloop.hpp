@@ -364,18 +364,18 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       bool is_cache;    // true => use KV-cache tensors; false => main KV tensors
     };
 
-    auto make_block_desc = [&](int K) -> BlockDesc {
-      bool is_cache = CachedKV && (K < kblocks_cache);
+    auto make_block_desc = [&](int block_idx) -> BlockDesc {
+      bool is_cache = CachedKV && (block_idx < kblocks_cache);
       int physical_k;
       if (is_cache) {
-        physical_k = K;
+        physical_k = block_idx;
         if constexpr (PagedKV) {
-          physical_k = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
+          physical_k = get_physical_k_tile(block_idx, l_coord, seq_len_kv_cache);
         }
       } else {
-        physical_k = K - kblocks_cache;
+        physical_k = block_idx - kblocks_cache;
       }
-      return {K, physical_k, is_cache};
+      return {block_idx, physical_k, is_cache};
     };
 
     // Stage A: Compute Q*K for block desc and accumulate into tSrS_dst.

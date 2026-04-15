@@ -113,8 +113,12 @@ ninja 06_xe_fmha_fwd
     --verify=true
 ```
 
-The pipelined mainloop produces bit-identical results to the serial one for
-all non-masked tiles (online softmax accumulation is unchanged).
+The pipelined mainloop produces bit-identical results to the serial one.
+Unmasked tiles are numerically unchanged because the online softmax accumulation
+order is preserved.  For masked positions (set to `-INF` before softmax), the
+`exp(-INF) = 0` path is also unchanged; the mask is still applied inside
+`apply_mask_block` before `softmax` runs on the same slot, so masked elements
+contribute zero to the output accumulator exactly as in the serial schedule.
 
 ### 2. Performance (XMX/XVX overlap)
 

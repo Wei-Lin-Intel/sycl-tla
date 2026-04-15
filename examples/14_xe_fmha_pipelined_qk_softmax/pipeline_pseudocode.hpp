@@ -81,7 +81,8 @@ namespace fmha_pipeline_pseudocode {
 using ElementS   = float;      // Q*K accumulator element (typically fp32)
 using FragS      = float[64];  // QK fragment  (size depends on tile/atom)
 using FragAforP  = float[64];  // PV-A fragment (reordered P, same element type)
-using FragSRow   = float[4];   // Per-row softmax state (max / sum / rescale)
+using FragSRow   = float[4];   // Per-row softmax state (one entry per row-group;
+                               // holds max or sum depending on context)
 
 // ---------------------------------------------------------------------------
 // BlockDesc: unifies logical/physical K indexing across cache/paged paths
