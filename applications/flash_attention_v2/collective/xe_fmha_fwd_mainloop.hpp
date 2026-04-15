@@ -280,8 +280,24 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
 
-    auto tSrS = thr_mma_qk.partition_sg_fragment_C(cP);
-    auto tArP = thr_mma_pv.partition_sg_fragment_A(cP);
+    // FragAforP: named type for the P matrix fragment used in P*V GEMM.
+    // Named here so we can declare a 2-element array for the pipeline.
+    using FragAforP = decltype(thr_mma_pv.partition_sg_fragment_A(cP));
+
+    // 2-slot double-buffer pipeline fragments.
+    //
+    // Pipeline scheduling overview:
+    //   Prologue:     QK(blk_k0)           -> tSrS_pipe[0]          [XMX]
+    //   Steady-state: QK(k+1)              -> tSrS_pipe[next_slot]  [XMX]
+    //                 mask(k) + softmax(k) on tSrS_pipe[cur_slot]   [XVX - overlaps QK above]
+    //                 PV(k)  using tArP_pipe[cur_slot]              [XMX - after softmax]
+    //   Epilogue:     mask + softmax + PV on tSrS_pipe[last_slot]   (no next-QK to overlap)
+    //
+    // Placing QK(next) BEFORE softmax(cur) in the instruction stream gives the
+    // hardware scheduler the best opportunity to overlap XMX (matrix engine)
+    // and XVX (vector/scalar) work concurrently.
+    FragS     tSrS_pipe[2];   // Q*K accumulator, double-buffered over K-blocks
+    FragAforP tArP_pipe[2];   // reordered P (softmax output) for P*V input, double-buffered
 
     auto tVrV = thr_copy_v.partition_sg_fragment_D(gV_split(_,_,0,0));
     auto tArV = thr_mma_pv.partition_sg_fragment_B(gV_split(_,_,0,0));
@@ -331,138 +347,258 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       clear(tA_sum);
     }
 
-    /* Check if */
+    /* Check if the last K tile is a partial (remainder) tile. */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
-    /* Main loop body */
-    auto mainloop_body = [&](auto cached_k, int K,
-                            auto& copy_k_cur, auto& copy_v_cur,
-                            auto& prefetch_v_cur, auto& tKgK_cur,
-                            auto& tVgV_cur, auto& pVgV_cur) {
-      /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
-      constexpr bool is_cache = decltype(cached_k)::value;
+    // =====================================================================
+    // Pipeline helper lambdas
+    // =====================================================================
 
-      int k_idx;
-      if constexpr (is_cache) {
-        k_idx = K;
+    // Build a per-block descriptor: maps logical K index to its physical index
+    // and whether it comes from the KV cache or the main KV tensors.
+    // This unifies causal/paged/cached dispatch so a single pipeline loop
+    // can drive all K-block variants.
+    struct BlockDesc {
+      int  logical_k;   // logical block index (used for mask boundary checks)
+      int  physical_k;  // physical block index (0-based in the tensor it indexes)
+      bool is_cache;    // true => use KV-cache tensors; false => main KV tensors
+    };
+
+    auto make_block_desc = [&](int K) -> BlockDesc {
+      bool is_cache = CachedKV && (K < kblocks_cache);
+      int physical_k;
+      if (is_cache) {
+        physical_k = K;
         if constexpr (PagedKV) {
-          k_idx = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
+          physical_k = get_physical_k_tile(K, l_coord, seq_len_kv_cache);
         }
       } else {
-        k_idx = K - kblocks_cache;
+        physical_k = K - kblocks_cache;
       }
+      return {K, physical_k, is_cache};
+    };
 
-      /* GEMM 1: S = K * Q */
-      clear(tSrS);
-      CUTLASS_PRAGMA_UNROLL
-      for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_,_,_,D), tQrQ);
-        copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
-        reorder(tQrQ, tSrQ);
-        reorder(tKrK, tSrK);
-
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+    // Stage A: Compute Q*K for block desc and accumulate into tSrS_dst.
+    // Also issues V prefetch for the subsequent P*V GEMM.
+    //
+    // Overlap target: the XMX DPAS instructions emitted here can run
+    // concurrently with the XVX (scalar/vector) softmax work issued on a
+    // *different* pipeline slot immediately afterwards.
+    auto compute_qk_block = [&](BlockDesc const& desc, FragS& tSrS_dst) {
+      clear(tSrS_dst);
+      if (desc.is_cache) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(tKgK); D++) {
+          copy(copy_q,       tQgQ(_,_,_,D),                  tQrQ);
+          copy(copy_k_cache, tKgK_cache(_,_,_,desc.physical_k,D), tKrK);
+          reorder(tQrQ, tSrQ);
+          reorder(tKrK, tSrK);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS_dst);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v_cache, pVgV_cache(_,_,_,VV,desc.physical_k));
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(tKgK); D++) {
+          copy(copy_q, tQgQ(_,_,_,D),              tQrQ);
+          copy(copy_k, tKgK(_,_,_,desc.physical_k,D), tKrK);
+          reorder(tQrQ, tSrQ);
+          reorder(tKrK, tSrK);
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS_dst);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v, pVgV(_,_,_,VV,desc.physical_k));
+        }
       }
+    };
 
-      /* V prefetch for GEMM 2 */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cur, pVgV_cur(_,_,_,VV,k_idx));
-      }
-      /* Causal masking - only in non-cache mode */
-      if constexpr (!is_cache && CausalMask) {
-        if (K == total_blk - 1) {
-          // Need to get global col and row indices to mask the elements
-          Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
-          Tensor gP = local_tile(cPgP, take<0,2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
-          auto cS_thread = thr_mma_qk.partition_C(gP);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            int row_idx = get<0>(cS_thread(i));
-            int col_idx = get<1>(cS_thread(i));
-            if (col_idx - seq_len_kv_cache - full_tile_offset > row_idx - discard_seq_coord) {
-              tSrS(i) = ElementS(-INFINITY);
+    // Stage B: Apply causal mask and K-remainder mask to a pipeline S slot.
+    // Only active for non-cache blocks that sit at a sequence boundary.
+    // These are scalar operations and are part of the XVX overlap window.
+    auto apply_mask_block = [&](BlockDesc const& desc, FragS& tSrS_slot) {
+      if (!desc.is_cache) {
+        if constexpr (CausalMask) {
+          if (desc.logical_k == total_blk - 1) {
+            Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+            Tensor gP   = local_tile(cPgP, take<0,2>(TileShapeQK{}),
+                                     make_coord(get<0>(blk_qv), desc.logical_k));
+            auto cS_thread = thr_mma_qk.partition_C(gP);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS_slot.size(); ++i) {
+              int row_idx = get<0>(cS_thread(i));
+              int col_idx = get<1>(cS_thread(i));
+              if (col_idx - seq_len_kv_cache - full_tile_offset >
+                  row_idx - discard_seq_coord) {
+                tSrS_slot(i) = ElementS(-INFINITY);
+              }
             }
           }
         }
-      }
-      /* k masking for remainder tiles */
-      if constexpr (!is_cache) {
-        if (check_remainder_k && K == total_blk - 1) {
+        if (check_remainder_k && desc.logical_k == total_blk - 1) {
           FragSRow k_rem_mask;
-          int k_val = get<0>(tKgK_cur(0,0,0,k_idx,0)) + kblocks_cache * get<1>(TileShapeQK{});
+          int k_val = get<0>(tKgK(0,0,0,desc.physical_k,0))
+                      + kblocks_cache * get<1>(TileShapeQK{});
           int k = k_val + get_sub_group().get_local_id()[0];
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
-            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u)) : ElementS(-INFINITY);
+            k_rem_mask(i) = (k < seq_len) ? ElementS(sycl::nan(0u))
+                                           : ElementS(-INFINITY);
           }
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); i++) {
-            tSrS(i) = sycl::fmin(tSrS(i), broadcast<1>(k_rem_mask, tSrS, i));
+          for (int i = 0; i < tSrS_slot.size(); i++) {
+            tSrS_slot(i) = sycl::fmin(tSrS_slot(i),
+                                      broadcast<1>(k_rem_mask, tSrS_slot, i));
           }
         }
       }
-
-      /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
-      reorder(tSrS, tArP);
-
-      /* GEMM 2: A += P * V, split in v dimension.
-        tArA rescaling is fused to per-VTile */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
-        reorder(tVrV, tArV);
-        if (K != blk_k0) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tArA.size() / VTiles; i++)
-            tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
-        }
-
-        cute::gemm(mma_pv, tArP, tArV, tArA(_,_,_,VV));
-      }
-
-      /* K prefetch */
-      int K_next = K + Stages;
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        if constexpr (is_cache) {
-          bool is_cache_next = K_next < kblocks_cache;
-          int physical_K_next = K_next;
-          if constexpr (PagedKV) {
-            if (is_cache_next) {
-              physical_K_next = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
-            }
-          }
-          if (is_cache_next) {
-            prefetch(prefetch_k_cache, pKgK_cache(_,_,_,physical_K_next,D));
-          } else {
-            prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
-          }
-        } else {
-          prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
-        }
-      }
-      barrier_wait(ScopeWorkgroup);
     };
 
-    /* Main loop, blocked in k. */
-    if constexpr (CachedKV) {
-      for (int K = blk_k0; K < kblocks_cache; K++) {
-        mainloop_body(std::bool_constant<true>{}, K,
-                      copy_k_cache, copy_v_cache,
-                      prefetch_v_cache, tKgK_cache,
-                      tVgV_cache, pVgV_cache);
+    // Stage C: Online softmax update + reorder S into P layout for P*V GEMM.
+    // These are XVX (vector/scalar ALU) operations. Placing them after
+    // compute_qk_block (Stage A) for the NEXT slot gives the hardware
+    // the opportunity to overlap XMX (Stage A) with XVX (this stage).
+    // Returns the per-row rescale factor for updating the output accumulator.
+    auto apply_softmax_and_prepare_p = [&](bool first_block,
+                                           FragS     & tSrS_slot,
+                                           FragAforP & tArP_slot) -> FragSRow {
+      auto rescale = softmax(first_block, tSrS_slot, tA_max, tA_sum);
+      reorder(tSrS_slot, tArP_slot);
+      return rescale;
+    };
+
+    // Stage D: Accumulate P*V into the output accumulator tArA.
+    // Applies the softmax rescale to the existing accumulator before
+    // adding the new P*V contribution.  Kept as a separate phase from
+    // compute_qk_block to avoid two XMX streams competing simultaneously.
+    auto accumulate_pv_block = [&](BlockDesc   const& desc,
+                                   FragAforP   const& tArP_slot,
+                                   FragSRow    const& rescale,
+                                   bool               first_block) {
+      if (desc.is_cache) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v_cache, tVgV_cache(_,_,_,VV,desc.physical_k), tVrV);
+          reorder(tVrV, tArV);
+          if (!first_block) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++)
+              tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
+          }
+          cute::gemm(mma_pv, tArP_slot, tArV, tArA(_,_,_,VV));
+        }
+      } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          copy(copy_v, tVgV(_,_,_,VV,desc.physical_k), tVrV);
+          reorder(tVrV, tArV);
+          if (!first_block) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tArA.size() / VTiles; i++)
+              tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
+          }
+          cute::gemm(mma_pv, tArP_slot, tArV, tArA(_,_,_,VV));
+        }
       }
+    };
+
+    // Prefetch K tiles for a future block (hint; silently skips out-of-range
+    // indices as prefetch is a non-faulting hint on Intel Xe).
+    auto prefetch_k_block = [&](int K_next) {
+      bool is_cache_next = CachedKV && (K_next < kblocks_cache);
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        if (is_cache_next) {
+          int phys = K_next;
+          if constexpr (PagedKV) {
+            phys = get_physical_k_tile(K_next, l_coord, seq_len_kv_cache);
+          }
+          prefetch(prefetch_k_cache, pKgK_cache(_,_,_,phys,D));
+        } else {
+          prefetch(prefetch_k, pKgK(_,_,_,K_next - kblocks_cache,D));
+        }
+      }
+    };
+
+    // =====================================================================
+    // 2-slot block pipeline
+    //
+    // Unified K range [k_start, k_end).  For CachedKV kernels,
+    // K in [k_start, kblocks_cache) are cache blocks and
+    // K in [kblocks_cache, k_end) are main KV blocks; make_block_desc
+    // handles the dispatch transparently.
+    // =====================================================================
+    const int k_start  = blk_k0;
+    const int k_end    = blk_k1;
+    const int n_blocks = k_end - k_start;
+
+    if (n_blocks == 0) return;
+
+    // ------------------------------------------------------------------
+    // Prologue: compute QK for the first block into pipeline slot 0.
+    // ------------------------------------------------------------------
+    {
+      barrier_arrive(ScopeWorkgroup);
+      compute_qk_block(make_block_desc(k_start), tSrS_pipe[0]);
+      barrier_wait(ScopeWorkgroup);
     }
 
-    for (int K = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache); K < blk_k1; K++) {
-      mainloop_body(std::bool_constant<false>{}, K,
-                    copy_k, copy_v,
-                    prefetch_v, tKgK,
-                    tVgV, pVgV);
+    // ------------------------------------------------------------------
+    // Steady-state: for k = k_start .. k_end-2 overlap
+    //   [XMX]        QK(k+1)     -> tSrS_pipe[next_slot]
+    //   [XVX/scalar] softmax(k)  on tSrS_pipe[cur_slot]   (targets XVX; can overlap XMX above)
+    //   [XMX]        PV(k)       using tArP_pipe[cur_slot] (after softmax; separate XMX phase)
+    // ------------------------------------------------------------------
+    for (int k = k_start; k < k_end - 1; k++) {
+      const int cur_slot  = (k - k_start) & 1;
+      const int next_slot = cur_slot ^ 1;
+
+      auto cur_desc  = make_block_desc(k);
+      auto next_desc = make_block_desc(k + 1);
+
+      barrier_arrive(ScopeWorkgroup);
+
+      // Issue QK for the NEXT block first (XMX).
+      // The subsequent softmax work targets XVX and can overlap with this.
+      compute_qk_block(next_desc, tSrS_pipe[next_slot]);
+
+      // Apply mask and run softmax on the CURRENT block's S slot (XVX path).
+      // These scalar/vector operations are the primary overlap target with
+      // the XMX work issued by compute_qk_block above.
+      apply_mask_block(cur_desc, tSrS_pipe[cur_slot]);
+      auto rescale = apply_softmax_and_prepare_p(k == k_start,
+                                                 tSrS_pipe[cur_slot],
+                                                 tArP_pipe[cur_slot]);
+
+      // Accumulate P*V for the current block (XMX, runs after softmax).
+      // Kept after the softmax window to avoid two concurrent XMX streams.
+      accumulate_pv_block(cur_desc, tArP_pipe[cur_slot], rescale, k == k_start);
+
+      // Prefetch K for Stages iterations ahead of the next block
+      prefetch_k_block(k + Stages + 1);
+
+      barrier_wait(ScopeWorkgroup);
+    }
+
+    // ------------------------------------------------------------------
+    // Epilogue: drain the final block.
+    // The last block's QK result already sits in tSrS_pipe[last_slot];
+    // just apply mask + softmax + PV with no next-QK to overlap.
+    // ------------------------------------------------------------------
+    {
+      const int last_k    = k_end - 1;
+      const int last_slot = (last_k - k_start) & 1;
+      auto last_desc = make_block_desc(last_k);
+
+      apply_mask_block(last_desc, tSrS_pipe[last_slot]);
+      auto rescale = apply_softmax_and_prepare_p(last_k == k_start,
+                                                 tSrS_pipe[last_slot],
+                                                 tArP_pipe[last_slot]);
+      accumulate_pv_block(last_desc, tArP_pipe[last_slot], rescale, last_k == k_start);
     }
   }
+
 
   // Single step of blocked softmax.
   CUTLASS_DEVICE
