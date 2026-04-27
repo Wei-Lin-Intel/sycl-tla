@@ -59,16 +59,29 @@ struct Options {
   bool help;
   bool error;
   bool is_causal;
+  bool print_performance = true;
   bool varlen = false;
   bool use_paged_kv = false;
   std::string scheduler;
 
   int batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, page_size, head_size_qk, head_size_vo, iterations, warmup, verify;
   float softmax_scale;
+  const void *external_q;
+  const void *external_k;
+  const void *external_v;
+  void *external_o;
+  bool use_external_strides;
+  int stride_q_s, stride_q_h, stride_q_b;
+  int stride_k_s, stride_k_h, stride_k_b;
+  int stride_v_s, stride_v_h, stride_v_b;
+  int stride_o_s, stride_o_h, stride_o_b;
 
   Options()
-      : help(false), error(false), is_causal(false), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
-        seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual") {}
+      : help(false), error(false), is_causal(false), print_performance(true), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
+        seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual"),
+        external_q(nullptr), external_k(nullptr), external_v(nullptr), external_o(nullptr), use_external_strides(false),
+        stride_q_s(0), stride_q_h(0), stride_q_b(0), stride_k_s(0), stride_k_h(0), stride_k_b(0),
+        stride_v_s(0), stride_v_h(0), stride_v_b(0), stride_o_s(0), stride_o_h(0), stride_o_b(0) {}
 
   // Parses the command line
   void parse(int argc, char const **args) {
@@ -106,7 +119,11 @@ struct Options {
 #else
     cmd.get_cmd_line_argument("seq_len_qo", seq_len_qo, seq_len_kv);
 #endif
+#ifdef HEAD_DIM
     cmd.get_cmd_line_argument("head_size_vo", head_size_vo, HEAD_DIM);
+#else
+    cmd.get_cmd_line_argument("head_size_vo", head_size_vo, head_size_vo);
+#endif
     cmd.get_cmd_line_argument("head_size_qk", head_size_qk, head_size_vo);
     cmd.get_cmd_line_argument("iterations", iterations, 100);
     cmd.get_cmd_line_argument("warmup", warmup, 100);
@@ -225,6 +242,7 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   cutlass::DeviceAllocation<ElementV> block_V_cache;
   cutlass::DeviceAllocation<ElementO> block_O;
   cutlass::DeviceAllocation<ElementO> block_ref_O;
+  cutlass::device_memory::allocation<uint8_t> workspace;
 
   std::vector<int> cumulative_seqlen_q;
   std::vector<int> cumulative_seqlen_kv;
@@ -587,6 +605,10 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 
   /// Initialize operands to be used in the GEMM and reference GEMM
   ProblemShapeType initialize(const Options &options) {
+    bool useExternalInputDirect =
+        options.verify == 0 && options.external_q && options.external_k &&
+        options.external_v;
+
     auto problem_shape_in = cute::make_tuple(options.batch, options.num_heads_q, options.num_heads_kv, options.seq_len_qo, options.seq_len_kv, options.seq_len_kv_cache, options.head_size_qk, options.head_size_vo);
     ProblemShapeType shape;
 
@@ -623,13 +645,36 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     stride_V_cache = cutlass::make_cute_packed_stride(StrideV{}, shape_V_cache);
     stride_O = cutlass::make_cute_packed_stride(StrideO{}, shape_O);
 
-    block_Q.reset(static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_qk);
-    block_K.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv * head_size_qk);
-    block_V.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv * head_size_vo);
-    block_K_cache.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv_cache * head_size_qk);
-    block_V_cache.reset(static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv_cache * head_size_vo);
-    block_O.reset(static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_vo);
-    block_ref_O.reset(static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_vo);
+    // Keep existing packed-stride defaults unless external tensor strides are provided.
+    if (options.use_external_strides) {
+      stride_Q = StrideQ{options.stride_q_s, _1{}, options.stride_q_h, options.stride_q_b};
+      stride_K = StrideK{options.stride_k_s, _1{}, options.stride_k_h, options.stride_k_b};
+      stride_V = StrideV{_1{}, options.stride_v_s, options.stride_v_h, options.stride_v_b};
+      stride_O = StrideO{options.stride_o_s, _1{}, options.stride_o_h, options.stride_o_b};
+    }
+
+    auto ensureCapacity = [](auto &buffer, std::size_t requiredElements) {
+      if (buffer.size() != requiredElements) {
+        buffer.reset(requiredElements);
+      }
+    };
+
+    std::size_t qElements = static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_qk;
+    std::size_t kElements = static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv * head_size_qk;
+    std::size_t vElements = static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv * head_size_vo;
+    std::size_t kCacheElements = static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv_cache * head_size_qk;
+    std::size_t vCacheElements = static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv_cache * head_size_vo;
+    std::size_t oElements = static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_vo;
+
+    ensureCapacity(block_Q, qElements);
+    ensureCapacity(block_K, kElements);
+    ensureCapacity(block_V, vElements);
+    ensureCapacity(block_K_cache, kCacheElements);
+    ensureCapacity(block_V_cache, vCacheElements);
+    ensureCapacity(block_O, oElements);
+    if (options.verify != 0) {
+      ensureCapacity(block_ref_O, oElements);
+    }
     // Zero-initialize output buffer for the kernel result
     // block_ref_O is fully written in verify() before being read, so no initialization needed
     compat::memset(block_O.get(), 0, block_O.size() * sizeof_bits_v<ElementO> / 8);
@@ -663,9 +708,29 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       compat::memcpy(paged_kv_cache.num_pages_per_seq.get(), num_pages_per_seq.data(), num_pages_per_seq.size() * sizeof(int));
     }
 
-    initialize_block(block_Q, seed + 2023);
-    initialize_block(block_K, seed + 2022);
-    initialize_block(block_V, seed + 2021);
+    if (options.external_q && !useExternalInputDirect) {
+      compat::memcpy<ElementQ>(static_cast<ElementQ *>(block_Q.get()),
+                               static_cast<const ElementQ *>(options.external_q),
+                               block_Q.size());
+    } else if (!options.external_q) {
+      initialize_block(block_Q, seed + 2023);
+    }
+
+    if (options.external_k && !useExternalInputDirect) {
+      compat::memcpy<ElementK>(static_cast<ElementK *>(block_K.get()),
+                               static_cast<const ElementK *>(options.external_k),
+                               block_K.size());
+    } else if (!options.external_k) {
+      initialize_block(block_K, seed + 2022);
+    }
+
+    if (options.external_v && !useExternalInputDirect) {
+      compat::memcpy<ElementV>(static_cast<ElementV *>(block_V.get()),
+                               static_cast<const ElementV *>(options.external_v),
+                               block_V.size());
+    } else if (!options.external_v) {
+      initialize_block(block_V, seed + 2021);
+    }
     initialize_block(block_K_cache, seed + 2024);
     initialize_block(block_V_cache, seed + 2025);
     
@@ -726,13 +791,34 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 
     ProblemShapeType shape = initialize(options);
 
+    bool useExternalInputDirect =
+      options.verify == 0 && options.external_q && options.external_k &&
+      options.external_v;
+    bool useExternalOutputDirect = options.verify == 0 && options.external_o;
+
+    ElementQ *qPtr = useExternalInputDirect
+      ? const_cast<ElementQ *>(
+          static_cast<const ElementQ *>(options.external_q))
+      : block_Q.get();
+    ElementK *kPtr = useExternalInputDirect
+      ? const_cast<ElementK *>(
+          static_cast<const ElementK *>(options.external_k))
+      : block_K.get();
+    ElementV *vPtr = useExternalInputDirect
+      ? const_cast<ElementV *>(
+          static_cast<const ElementV *>(options.external_v))
+      : block_V.get();
+    ElementO *oPtr = useExternalOutputDirect
+      ? static_cast<ElementO *>(options.external_o)
+      : block_O.get();
+
     typename FMHAKernel::Arguments arguments{
       {
         shape,
-        block_Q.get(), stride_Q,
-        block_K.get(), stride_K,
-        block_V.get(), stride_V,
-        block_O.get(), stride_O,
+      qPtr, stride_Q,
+      kPtr, stride_K,
+      vPtr, stride_V,
+      oPtr, stride_O,
         block_K_cache.get(), stride_K_cache,
         block_V_cache.get(), stride_V_cache,
       },
@@ -748,7 +834,9 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 
     // Define device-global scratch memory
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+    if (workspace.size() != workspace_size) {
+      workspace.reset(workspace_size);
+    }
 
     if (!FMHAKernel::can_implement(arguments)) {
       std::cout << "Invalid Problem Size: " << options.batch << 'x' << options.num_heads_q << 'x' <<
@@ -778,8 +866,6 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       if (!passed) {
         return cutlass::Status::kErrorInternal;
       }
-    } else {
-      std::cout << "Disposition is skipped." << std::endl;
     }
     if (options.iterations > 0) {
       GPU_Clock timer;
@@ -833,21 +919,28 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
         batched_seq_len_kv_cache = options.batch * seq_len_kv_cache;
       }
 
-      double flops_qk = 2.0 * options.num_heads_q * batched_effective_seq_len_qo_x_kv * options.head_size_qk;
-      double flops_pv = 2.0 * options.num_heads_q * batched_effective_seq_len_qo_x_kv * options.head_size_vo;
-      double tflops = ((flops_qk + flops_pv) * 1e-12) / cute_time;
-      
-      double batched_seq_len_kv_total = batched_effective_seq_len_kv + batched_seq_len_kv_cache;
-      double gbps_qk = options.num_heads_q * batched_effective_seq_len_qo * options.head_size_qk * sizeof_bits_v<ElementQ> / 8 +
-                       options.num_heads_kv * batched_seq_len_kv_total * options.head_size_qk * sizeof_bits_v<ElementK> / 8;
-      double gbps_pv = options.num_heads_kv * batched_seq_len_kv_total * options.head_size_vo * sizeof_bits_v<ElementV> / 8 +
-                       options.num_heads_q * batched_effective_seq_len_qo * options.head_size_vo * sizeof_bits_v<ElementO> / 8;
-      double gbps = ((gbps_qk + gbps_pv) * 1e-9) / cute_time;
-      std::cout << "Batch: " << options.batch << "\tNumHeads_q: " << options.num_heads_q  << "\tNumHeads_kv: " << options.num_heads_kv  << "\tSeq Length QO: " << options.seq_len_qo
-                << "\tSeq Length KV: " << options.seq_len_kv << "\tHead Size QK: " << options.head_size_qk << "\tHead Size VO: " << options.head_size_vo
-                << "\tCausal Mask: " << (options.is_causal ? "true" : "false") << "\tVariable Sequence Length: " << (options.varlen ? "true" : "false")
-                << "\t Scheduler: " << options.scheduler;
-      printf("\nPerformance:   %4.3f  GB/s,    %4.3f  TFlop/s,   %6.4f  ms\n\n", gbps, tflops, cute_time * 1000);
+      if (options.print_performance) {
+        double flops_qk = 2.0 * options.num_heads_q * batched_effective_seq_len_qo_x_kv * options.head_size_qk;
+        double flops_pv = 2.0 * options.num_heads_q * batched_effective_seq_len_qo_x_kv * options.head_size_vo;
+        double tflops = ((flops_qk + flops_pv) * 1e-12) / cute_time;
+
+        double batched_seq_len_kv_total = batched_effective_seq_len_kv + batched_seq_len_kv_cache;
+        double gbps_qk = options.num_heads_q * batched_effective_seq_len_qo * options.head_size_qk * sizeof_bits_v<ElementQ> / 8 +
+                         options.num_heads_kv * batched_seq_len_kv_total * options.head_size_qk * sizeof_bits_v<ElementK> / 8;
+        double gbps_pv = options.num_heads_kv * batched_seq_len_kv_total * options.head_size_vo * sizeof_bits_v<ElementV> / 8 +
+                         options.num_heads_q * batched_effective_seq_len_qo * options.head_size_vo * sizeof_bits_v<ElementO> / 8;
+        double gbps = ((gbps_qk + gbps_pv) * 1e-9) / cute_time;
+        std::cout << "Batch: " << options.batch << "\tNumHeads_q: " << options.num_heads_q  << "\tNumHeads_kv: " << options.num_heads_kv  << "\tSeq Length QO: " << options.seq_len_qo
+                  << "\tSeq Length KV: " << options.seq_len_kv << "\tHead Size QK: " << options.head_size_qk << "\tHead Size VO: " << options.head_size_vo
+                  << "\tCausal Mask: " << (options.is_causal ? "true" : "false") << "\tVariable Sequence Length: " << (options.varlen ? "true" : "false")
+                  << "\t Scheduler: " << options.scheduler;
+        printf("\nPerformance:   %4.3f  GB/s,    %4.3f  TFlop/s,   %6.4f  ms\n\n", gbps, tflops, cute_time * 1000);
+      }
+    }
+
+    if (options.external_o && !useExternalOutputDirect) {
+      compat::memcpy<ElementO>(static_cast<ElementO *>(options.external_o),
+                               block_O.get(), block_O.size());
     }
 
     return cutlass::Status::kSuccess;
@@ -950,7 +1043,7 @@ struct FMHAConfig {
         ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>
         >;
 
-    ExampleRunner<FMHAKernel, isVarLen> runner;
+    static thread_local ExampleRunner<FMHAKernel, isVarLen> runner;
 
     CUTLASS_CHECK(runner.run(options, hw_info));
     return 0;
