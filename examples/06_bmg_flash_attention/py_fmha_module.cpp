@@ -11,6 +11,27 @@ namespace py = pybind11;
 
 namespace {
 
+class CompatDeviceGuard {
+public:
+      explicit CompatDeviceGuard(unsigned int device_id)
+                  : previous_device_id_(compat::get_current_device_id()) {
+            if (previous_device_id_ != device_id) {
+                  compat::select_device(device_id);
+                  changed_ = true;
+            }
+      }
+
+      ~CompatDeviceGuard() {
+            if (changed_) {
+                  compat::select_device(previous_device_id_);
+            }
+      }
+
+private:
+      unsigned int previous_device_id_;
+      bool changed_ = false;
+};
+
 template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
           typename SubgroupLayoutQK>
 int runPrefill(const Options &options) {
@@ -187,6 +208,10 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
       TORCH_CHECK(out.scalar_type() == at::kFloat,
                                   "out must have float32 dtype");
       TORCH_CHECK(out.dim() == 4, "out must be a rank-4 tensor");
+      TORCH_CHECK(q.device().has_index(), "q must have a concrete XPU device index");
+      const auto tensor_device_index = q.device().index();
+      TORCH_CHECK(tensor_device_index >= 0, "q must have a non-negative XPU device index");
+      CompatDeviceGuard device_guard(static_cast<unsigned int>(tensor_device_index));
 
       bool useDirectStrides =
             verify == 0 && can_use_direct_stride_path(q) &&
@@ -224,17 +249,16 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
       std::array<int64_t, 3> oStrides{out.stride(2), out.stride(1), out.stride(0)};
 
       const int ret = prefillBf16Impl(
-      static_cast<int>(batch), static_cast<int>(numHeadsQ),
-      static_cast<int>(numHeadsKV), static_cast<int>(seqLenQO),
-      static_cast<int>(seqLenKV), static_cast<int>(headSizeQK),
-      static_cast<int>(headSizeVO), isCausal, iterations, warmup, verify,
-        qTensor.data_ptr(), kTensor.data_ptr(), vTensor.data_ptr(),
-        out.data_ptr<float>(),
-        useDirectStrides ? qStrides.data() : nullptr,
-        useDirectStrides ? kStrides.data() : nullptr,
-        useDirectStrides ? vStrides.data() : nullptr,
-        useDirectStrides ? oStrides.data() : nullptr);
-
+            static_cast<int>(batch), static_cast<int>(numHeadsQ),
+            static_cast<int>(numHeadsKV), static_cast<int>(seqLenQO),
+            static_cast<int>(seqLenKV), static_cast<int>(headSizeQK),
+            static_cast<int>(headSizeVO), isCausal, iterations, warmup, verify,
+            qTensor.data_ptr(), kTensor.data_ptr(), vTensor.data_ptr(),
+            out.data_ptr<float>(),
+            useDirectStrides ? qStrides.data() : nullptr,
+            useDirectStrides ? kStrides.data() : nullptr,
+            useDirectStrides ? vStrides.data() : nullptr,
+            useDirectStrides ? oStrides.data() : nullptr);
       TORCH_CHECK(ret == 0, "prefill_bf16_tensor failed in kernel run");
   return out;
 }

@@ -41,6 +41,7 @@
 #include "cutlass/util/sycl_event_manager.hpp"
 #include <cute/tensor.hpp>
 #include <random>
+#include <unordered_map>
 
 #include "helper.h"
 #include "cutlass/util/command_line.h"
@@ -606,8 +607,8 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   /// Initialize operands to be used in the GEMM and reference GEMM
   ProblemShapeType initialize(const Options &options) {
     bool useExternalInputDirect =
-        options.verify == 0 && options.external_q && options.external_k &&
-        options.external_v;
+      options.verify == 0 && options.external_q && options.external_k &&
+      options.external_v;
 
     auto problem_shape_in = cute::make_tuple(options.batch, options.num_heads_q, options.num_heads_kv, options.seq_len_qo, options.seq_len_kv, options.seq_len_kv_cache, options.head_size_qk, options.head_size_vo);
     ProblemShapeType shape;
@@ -991,6 +992,7 @@ struct FMHAConfig {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = static_cast<int>(compat::get_current_device_id());
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
@@ -1043,7 +1045,8 @@ struct FMHAConfig {
         ProblemShapeType, CollectiveMainloop, CollectiveEpilogue, Scheduler>
         >;
 
-    static thread_local ExampleRunner<FMHAKernel, isVarLen> runner;
+    static thread_local std::unordered_map<int, ExampleRunner<FMHAKernel, isVarLen>> runners;
+    auto &runner = runners[hw_info.device_id];
 
     CUTLASS_CHECK(runner.run(options, hw_info));
     return 0;
