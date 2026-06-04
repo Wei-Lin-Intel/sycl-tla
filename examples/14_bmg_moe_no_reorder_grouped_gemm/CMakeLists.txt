@@ -1,0 +1,48 @@
+# Copyright (C) 2025 - 2026 Intel Corporation. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# Only build when NOT using g++ host compiler: the MoE kernel headers from
+# example 12 use Intel-specific SYCL extensions (sub_group_size, 2D block loads,
+# DPAS atoms) that g++ does not support as a DPC++ host compiler.
+if(NOT "${DPCPP_HOST_COMPILER}" MATCHES "g\\+\\+")
+  cutlass_example_add_executable(
+    14_bmg_moe_no_reorder_grouped_gemm
+    14_bmg_moe_no_reorder_grouped_gemm.cpp
+  )
+  # Add example 12's directory so we can reuse moe_grouped_gemm.hpp,
+  # moe_gemms.hpp and moe_tile_scheduler.hpp without copying them.
+  target_include_directories(14_bmg_moe_no_reorder_grouped_gemm PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../12_xe20_moe_gemm_cute_interface
+  )
+  if(NOT DPCPP_SYCL_TARGET STREQUAL "spir64")
+    # TODO(codeplay): Remove once IGC VectorAliasThreshold issue is fixed
+    target_link_options(14_bmg_moe_no_reorder_grouped_gemm PRIVATE
+      -Xs "-options \"-igc_opts 'VectorAliasBBThreshold=10000'\""
+    )
+  endif()
+endif()

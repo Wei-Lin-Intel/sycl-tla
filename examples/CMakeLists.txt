@@ -121,6 +121,7 @@ if(CUTLASS_ENABLE_SYCL)
       11_xe20_cutlass_library
       12_xe20_moe_gemm_cute_interface
       13_bmg_gemm_bias
+      14_bmg_moe_no_reorder_grouped_gemm
       )
       add_subdirectory(${EXAMPLE})
     endforeach()
