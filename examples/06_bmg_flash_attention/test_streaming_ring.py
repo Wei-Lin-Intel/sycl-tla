@@ -134,6 +134,8 @@ class StreamingRingXPUTest(unittest.TestCase):
             call(q, k[:, :1], v[:, :1], *metadata, 0, 1, 1, False, 4)
         with self.assertRaisesRegex(RuntimeError, "bfloat16"):
             call(q.float(), k, v, *metadata, 0, 1, 1, False, 4)
+        with self.assertRaisesRegex(RuntimeError, "XPU"):
+            call(q.cpu(), k, v, *metadata, 0, 1, 1, False, 4)
         bad_ptrs = metadata[3].to(torch.int32)
         with self.assertRaisesRegex(RuntimeError, "torch.int64"):
             call(
@@ -149,6 +151,40 @@ class StreamingRingXPUTest(unittest.TestCase):
                 False,
                 4,
             )
+        with self.assertRaisesRegex(RuntimeError, "world_size entries"):
+            call(
+                q,
+                k,
+                v,
+                *metadata[:3],
+                metadata[3][:0],
+                *metadata[4:],
+                0,
+                1,
+                1,
+                False,
+                4,
+            )
+        bad_signals = torch.empty(
+            (0, 3), dtype=torch.int32, device=device
+        )
+        with self.assertRaisesRegex(RuntimeError, "signal_pad"):
+            call(
+                q,
+                k,
+                v,
+                metadata[0],
+                metadata[1],
+                bad_signals,
+                *metadata[3:],
+                0,
+                1,
+                1,
+                False,
+                4,
+            )
+        with self.assertRaisesRegex(RuntimeError, "positive"):
+            call(q, k, v, *metadata, 0, 1, 0, False, 4)
 
 
 def run_distributed():

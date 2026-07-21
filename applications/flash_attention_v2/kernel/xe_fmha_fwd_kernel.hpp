@@ -392,6 +392,10 @@ public:
     StrideK dK_cache{};
     const ElementV *V_cache = nullptr;
     StrideV dV_cache{};
+    float *LSE = nullptr;
+    int stride_lse_s = 1;
+    int stride_lse_h = 0;
+    int stride_lse_b = 0;
   };
   using KernelParams = KernelArguments;
 

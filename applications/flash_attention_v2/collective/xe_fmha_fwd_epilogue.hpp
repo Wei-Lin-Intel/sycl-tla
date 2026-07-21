@@ -158,25 +158,10 @@ public:
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    auto rLSE = make_fragment_like<ElementA>(rA);
-    if (lse && get<1>(blk_qv) == 0) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rLSE.size(); ++i) {
-        auto row_sum = broadcast<0>(rA_sum, rA, i);
-        auto row_max = broadcast<0>(rA_max, rA, i);
-        rLSE(i) = (row_max + sycl::log2(row_sum)) *
-                  ElementA(0.6931471805599453094);
-      }
-    }
-
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
-
-    CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)
-      rA(i) *= broadcast<0>(rA_sum, rA, i);
+      rA(i) /= broadcast<0>(rA_sum, rA, i);
 
     /* Tile output */
     Tensor cO = make_identity_tensor(O.shape());          // (q,v)
@@ -189,13 +174,23 @@ public:
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
+    /* Reorder tile and write out */
+    reorder(rA, tOrO);
+    copy(copy_o, tOrO, tOgO);
+
     if (lse && get<1>(blk_qv) == 0) {
-      auto tOrCoord = thr_copy_o.partition_sg_fragment_S(gO);
-      auto tOrLSE = make_fragment_like<ElementA>(tOrCoord);
-      reorder(rLSE, tOrLSE);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); ++i) {
+        auto row_sum = broadcast<0>(rA_sum, rA, i);
+        auto row_max = broadcast<0>(rA_max, rA, i);
+        rA(i) = ElementA(sycl::log(float(row_sum)) +
+                         float(row_max) * 0.6931471805599453094f);
+      }
+      auto tOrLSE = make_subgroup_tensor<ElementA>(tOrO.tv_layout());
+      reorder(rA, tOrLSE);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tOrLSE.size(); ++i) {
-        auto coord = tOrCoord(i);
+        auto coord = tOgO(i);
         int q = int(get<0>(coord));
         int v = int(get<1>(coord));
         if (v == 0 && q < seq_len_qo) {
@@ -204,9 +199,6 @@ public:
       }
     }
 
-    /* Reorder tile and write out */
-    reorder(rA, tOrO);
-    copy(copy_o, tOrO, tOgO);
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.

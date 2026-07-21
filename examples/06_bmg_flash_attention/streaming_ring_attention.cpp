@@ -34,6 +34,27 @@ class RingCopyKernel;
 class RingSignalWaitKernel;
 class RingMergeKernel;
 
+class CompatDeviceGuard {
+public:
+  explicit CompatDeviceGuard(unsigned int device)
+      : previous_(compat::get_current_device_id()) {
+    if (previous_ != device) {
+      compat::select_device(device);
+      changed_ = true;
+    }
+  }
+
+  ~CompatDeviceGuard() {
+    if (changed_) {
+      compat::select_device(previous_);
+    }
+  }
+
+private:
+  unsigned int previous_;
+  bool changed_ = false;
+};
+
 void check_data_tensor(const at::Tensor &tensor, const char *name,
                        const c10::Device &device) {
   TORCH_CHECK(tensor.device().type() == c10::DeviceType::XPU, name,
@@ -288,7 +309,7 @@ sycl::event launch_ring_copy(
   });
 }
 
-sycl::event launch_signal_wait(sycl::queue &queue, const int *signals,
+sycl::event launch_signal_wait(sycl::queue &queue, int *signals,
                                int slot, const RingInputs &inputs) {
   return queue.submit([&](sycl::handler &handler) {
     handler.parallel_for<RingSignalWaitKernel>(
@@ -469,6 +490,8 @@ std::tuple<at::Tensor, at::Tensor> streaming_ring_impl(
       q, k, v, k_workspace, v_workspace, signal_pad,
       peer_k_workspace_ptrs, peer_v_workspace_ptrs, peer_signal_ptrs, rank,
       world_size, iteration, is_causal, work_groups);
+  CompatDeviceGuard device_guard(
+      static_cast<unsigned int>(q.device().index()));
 
   auto output = torch::empty(
       {q.size(0), q.size(1), q.size(2), v.size(3)},
