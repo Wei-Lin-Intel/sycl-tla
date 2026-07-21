@@ -100,7 +100,11 @@ if(SYCL_TLA_BUILD_PYTHON_FMHA)
       "Cannot find required Torch libraries under ${TORCH_LIB_DIR}")
   endif()
 
-  add_library(sycl_tla_fmha MODULE py_fmha_module.cpp)
+  add_library(
+    sycl_tla_fmha MODULE
+    py_fmha_module.cpp
+    streaming_ring_attention.cpp
+  )
   cutlass_apply_standard_compile_options(sycl_tla_fmha)
   target_compile_features(sycl_tla_fmha PRIVATE cxx_std_17)
   target_include_directories(

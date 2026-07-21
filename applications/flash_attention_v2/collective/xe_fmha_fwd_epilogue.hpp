@@ -143,16 +143,31 @@ public:
              FragARow       & tA_max,   // Softmax row-wise max accumulator
              FragARow       & tA_sum,   // Softmax row-wise sum accumulator
              QVCoord          blk_qv,   // WG tile indices: (q,v)
-             int              thr_id) { // Work-item ID
+             int              thr_id,   // Work-item ID
+             float          * lse = nullptr,
+             int              stride_lse = 1,
+             int              seq_len_qo = 0x7fffffff) {
 
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_sum, rA_max, active] =
+        reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
+
+    auto rLSE = make_fragment_like<ElementA>(rA);
+    if (lse && get<1>(blk_qv) == 0) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rLSE.size(); ++i) {
+        auto row_sum = broadcast<0>(rA_sum, rA, i);
+        auto row_max = broadcast<0>(rA_max, rA, i);
+        rLSE(i) = (row_max + sycl::log2(row_sum)) *
+                  ElementA(0.6931471805599453094);
+      }
+    }
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
@@ -174,6 +189,21 @@ public:
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
+    if (lse && get<1>(blk_qv) == 0) {
+      auto tOrCoord = thr_copy_o.partition_sg_fragment_S(gO);
+      auto tOrLSE = make_fragment_like<ElementA>(tOrCoord);
+      reorder(rLSE, tOrLSE);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tOrLSE.size(); ++i) {
+        auto coord = tOrCoord(i);
+        int q = int(get<0>(coord));
+        int v = int(get<1>(coord));
+        if (v == 0 && q < seq_len_qo) {
+          lse[q * stride_lse] = float(tOrLSE(i));
+        }
+      }
+    }
+
     /* Reorder tile and write out */
     reorder(rA, tOrO);
     copy(copy_o, tOrO, tOgO);
@@ -193,7 +223,7 @@ public:
     using namespace sycl::ext::oneapi::this_work_item;
 
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_sum, tA_max, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1,3>(TiledMMAPV{}.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
@@ -285,7 +315,7 @@ public:
           }
         }
       }
-      return std::make_tuple(rA, rA_sum, active);
+      return std::make_tuple(rA, rA_sum, rA_max, active);
     }
   }
 };

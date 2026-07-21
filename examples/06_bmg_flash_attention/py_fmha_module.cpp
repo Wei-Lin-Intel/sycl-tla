@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 
 #include "xe_fmha_fwd_runner.hpp"
+#include "streaming_ring_attention.hpp"
 
 #include <array>
 #include <cmath>
@@ -297,4 +298,22 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("iterations") = 1,
         py::arg("warmup") = 0,
         py::arg("verify") = 0);
+
+  m.def("streaming_ring_bf16", &streaming_ring_bf16,
+        "Run non-causal BF16 streaming ring attention on XPU",
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("k_workspace"), py::arg("v_workspace"),
+        py::arg("signal_pad"), py::arg("peer_k_workspace_ptrs"),
+        py::arg("peer_v_workspace_ptrs"), py::arg("peer_signal_ptrs"),
+        py::arg("rank"), py::arg("world_size"), py::arg("iteration"),
+        py::arg("is_causal") = false, py::arg("work_groups") = 8);
+
+  m.def("streaming_ring_bf16_lse", &streaming_ring_bf16_lse,
+        "Run streaming ring attention and return (output, natural-log LSE)",
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("k_workspace"), py::arg("v_workspace"),
+        py::arg("signal_pad"), py::arg("peer_k_workspace_ptrs"),
+        py::arg("peer_v_workspace_ptrs"), py::arg("peer_signal_ptrs"),
+        py::arg("rank"), py::arg("world_size"), py::arg("iteration"),
+        py::arg("is_causal") = false, py::arg("work_groups") = 8);
 }

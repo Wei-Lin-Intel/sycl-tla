@@ -71,18 +71,25 @@ struct Options {
   const void *external_k;
   const void *external_v;
   void *external_o;
+  float *external_lse;
   bool use_external_strides;
   int stride_q_s, stride_q_h, stride_q_b;
   int stride_k_s, stride_k_h, stride_k_b;
   int stride_v_s, stride_v_h, stride_v_b;
   int stride_o_s, stride_o_h, stride_o_b;
+  int stride_lse_s, stride_lse_h, stride_lse_b;
+  sycl::queue *external_queue;
+  sycl::event *completion_event;
+  bool async_launch;
 
   Options()
       : help(false), error(false), is_causal(false), print_performance(true), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
         seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual"),
-        external_q(nullptr), external_k(nullptr), external_v(nullptr), external_o(nullptr), use_external_strides(false),
+        external_q(nullptr), external_k(nullptr), external_v(nullptr), external_o(nullptr), external_lse(nullptr), use_external_strides(false),
         stride_q_s(0), stride_q_h(0), stride_q_b(0), stride_k_s(0), stride_k_h(0), stride_k_b(0),
-        stride_v_s(0), stride_v_h(0), stride_v_b(0), stride_o_s(0), stride_o_h(0), stride_o_b(0) {}
+        stride_v_s(0), stride_v_h(0), stride_v_b(0), stride_o_s(0), stride_o_h(0), stride_o_b(0),
+        stride_lse_s(1), stride_lse_h(0), stride_lse_b(0), external_queue(nullptr),
+        completion_event(nullptr), async_launch(false) {}
 
   // Parses the command line
   void parse(int argc, char const **args) {
@@ -667,18 +674,25 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     std::size_t vCacheElements = static_cast<std::size_t>(batch) * num_heads_kv * seq_len_kv_cache * head_size_vo;
     std::size_t oElements = static_cast<std::size_t>(batch) * num_heads_q * seq_len_qo * head_size_vo;
 
-    ensureCapacity(block_Q, qElements);
-    ensureCapacity(block_K, kElements);
-    ensureCapacity(block_V, vElements);
+    if (!useExternalInputDirect) {
+      ensureCapacity(block_Q, qElements);
+      ensureCapacity(block_K, kElements);
+      ensureCapacity(block_V, vElements);
+    }
     ensureCapacity(block_K_cache, kCacheElements);
     ensureCapacity(block_V_cache, vCacheElements);
-    ensureCapacity(block_O, oElements);
+    if (!options.external_o || options.verify != 0) {
+      ensureCapacity(block_O, oElements);
+    }
     if (options.verify != 0) {
       ensureCapacity(block_ref_O, oElements);
     }
     // Zero-initialize output buffer for the kernel result
     // block_ref_O is fully written in verify() before being read, so no initialization needed
-    compat::memset(block_O.get(), 0, block_O.size() * sizeof_bits_v<ElementO> / 8);
+    if (!options.external_o || options.verify != 0) {
+      compat::memset(block_O.get(), 0,
+                     block_O.size() * sizeof_bits_v<ElementO> / 8);
+    }
     if (options.use_paged_kv) {
       paged_kv_cache.page_size = options.page_size;
       std::vector<int> num_pages_per_seq{0};
@@ -760,7 +774,8 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 
   // Note that the GemmUniversalAdapter currently doesn't support flash attention, which is why this
   // secondary `run` function is required to launch the kernel.
-  static void run(typename FMHAKernel::Params params)
+  static sycl::event run(typename FMHAKernel::Params params,
+                         sycl::queue queue = compat::get_default_queue())
   {
     namespace syclex = sycl::ext::oneapi::experimental;
     namespace intelex = sycl::ext::intel::experimental;
@@ -783,9 +798,11 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       intelex::grf_size<256>
     };
     compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(policy, params);
+    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAKernel>, FMHAKernel>(
+        policy, queue, params);
 
     EventManager::getInstance().addEvent(event);
+    return event;
   }
 
   cutlass::Status run(const Options &options, const cutlass::KernelHardwareInfo &hw_info) {
@@ -822,6 +839,10 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       oPtr, stride_O,
         block_K_cache.get(), stride_K_cache,
         block_V_cache.get(), stride_V_cache,
+        options.external_lse,
+        options.stride_lse_s,
+        options.stride_lse_h,
+        options.stride_lse_b,
       },
       {
         options.softmax_scale,
@@ -851,6 +872,15 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
     auto params = FMHAKernel::to_underlying_arguments(arguments, workspace.get());
+
+    if (options.async_launch) {
+      auto event = run(params, options.external_queue
+          ? *options.external_queue : compat::get_default_queue());
+      if (options.completion_event) {
+        *options.completion_event = event;
+      }
+      return cutlass::Status::kSuccess;
+    }
 
     // Run the GEMM
     // Warmup runs

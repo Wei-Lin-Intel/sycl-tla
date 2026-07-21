@@ -130,6 +130,10 @@ public:
     StrideK dK_cache{};
     const ElementV *V_cache;
     StrideV dV_cache{};
+    float *LSE = nullptr;
+    int stride_lse_s = 1;
+    int stride_lse_h = 0;
+    int stride_lse_b = 0;
   };
   using KernelParams = KernelArguments;
 
@@ -259,6 +263,9 @@ public:
       auto dcK_cache = const_cast<ElementK*>(p.K_cache + offset_k_cache);
       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
       auto ptrO = p.O + offset_o;
+      auto ptrLSE = p.LSE
+          ? p.LSE + idx_b * p.stride_lse_b + head_q * p.stride_lse_h
+          : nullptr;
 
       auto stride_q = is_var_len ? cutlass::make_cute_packed_stride(StrideQ{}, shape_Q) : p.dQ;
       auto stride_k = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K) : p.dK;
@@ -300,7 +307,7 @@ public:
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       epilogue(O(_,_,head_q,l_coord),
                tArA, tA_max, tA_sum,
-               blk_qv, thr_id);
+               blk_qv, thr_id, ptrLSE, p.stride_lse_s, seq_len_qo);
     }
   }
 };
