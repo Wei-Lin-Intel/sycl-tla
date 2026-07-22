@@ -103,6 +103,15 @@ public:
   using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
   using TiledCopyO = conditional_t<is_void_v<TiledCopyO_>, DefaultTiledCopyO, TiledCopyO_>;
 
+  static auto default_tiled_load_O_helper() {
+    if constexpr (ReduceK{} == _1{})
+      return make_block_2d_copy_C(TiledMMAPV{}, TensorO2D{});
+    else
+      return make_block_2d_copy_C_subtiled(TiledMMAPV{}, ReduceFragA{}.tv_layout(), ReduceSGLayout{}, TensorO2D{});
+  }
+
+  using TiledLoadO = decltype(default_tiled_load_O_helper());
+
   struct Arguments {
     ElementA* lse = nullptr;
     int stride_lse_q = 0;
@@ -133,8 +142,8 @@ public:
     return args;
   }
 
-  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
-    return true;
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    return !args.accumulate || args.lse;
   }
 
   CUTLASS_HOST_DEVICE
@@ -196,13 +205,19 @@ public:
     reorder(rA_lse_broadcast, tOrLSE);
 
     if (params.accumulate) {
-      auto tOrOldO = make_fragment_like(tOrO);
-      copy(copy_o, tOgO, tOrOldO);
+      TiledLoadO load_o{O};
+      auto thr_load_o = load_o.get_slice(thr_id);
+      auto tOgOldO = thr_load_o.partition_S(gO);
+      auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
+      copy(load_o, tOgOldO, tOrOldO);
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tOrO.size(); i++) {
         auto coord = tOgO(i);
         int q = get<0>(coord);
+        if (q >= size<0>(O)) {
+          continue;
+        }
         int lse_idx = q * params.stride_lse_q +
                       head_q * params.stride_lse_h +
                       idx_b * params.stride_lse_b;
