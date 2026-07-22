@@ -94,17 +94,23 @@ struct XeFMHABSHDIndividualTileScheduler {
   auto get_block_coord() {
     using namespace cute;
 
-    int linear = int(BlockIdxY());
+    int const linear = int(BlockIdxY());
 
-    // linear = q_batch * num_heads_q + head_q
+    // Keep head_q as the fastest-varying coordinate:
+    //
+    //   linear = ((idx_b * num_q_tiles) + blk_q) * num_heads_q
+    //            + head_q
+    //
+    // This makes adjacent work-groups process adjacent heads from the same
+    // query-token tile, matching the locality of a physical BSHD layout.
     int head_q;
-    int q_batch;
-    params.divmod_num_heads(linear, head_q, q_batch);
+    int const q_batch =
+        params.divmod_num_heads.divmod(head_q, linear);
 
-    // q_batch = idx_b * num_q_tiles + blk_q
+    // q_batch = idx_b * num_q_tiles + blk_q.
     int blk_q;
-    int idx_b;
-    params.divmod_num_q_tiles(q_batch, blk_q, idx_b);
+    int const idx_b =
+        params.divmod_num_q_tiles.divmod(blk_q, q_batch);
 
     int const blk_v = int(BlockIdxX());
     return make_coord(blk_q, blk_v, head_q, idx_b);
