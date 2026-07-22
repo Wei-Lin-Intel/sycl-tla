@@ -42,7 +42,7 @@ int runPrefill(const Options &options) {
                  bfloat16_t, bfloat16_t, bfloat16_t>;
 
   using Scheduler =
-      cutlass::fmha::kernel::XeFMHABSHDIndividualTileScheduler;
+      cutlass::fmha::kernel::XeFHMAIndividualTileScheduler;
 
   // The Python tensor entry point currently supports fixed-length,
   // non-cached, non-paged prefill. Select the BSHD scheduler directly
@@ -185,6 +185,36 @@ inline bool has_supported_base_stride(const at::Tensor &t) {
       return true;
 }
 
+inline bool is_packed_bhsd(const at::Tensor &t) {
+      if (!has_supported_base_stride(t)) {
+            return false;
+      }
+
+      const int64_t d = t.size(3);
+      const int64_t s = t.size(2);
+      const int64_t h = t.size(1);
+
+      return t.stride(2) == d &&
+             t.stride(1) == s * d &&
+             t.stride(0) == h * s * d;
+}
+
+// t has logical shape [B,H,S,D], but its backing storage is contiguous
+// [B,S,H,D].
+inline bool is_packed_bshd_view(const at::Tensor &t) {
+      if (!has_supported_base_stride(t)) {
+            return false;
+      }
+
+      const int64_t d = t.size(3);
+      const int64_t s = t.size(2);
+      const int64_t h = t.size(1);
+
+      return t.stride(1) == d &&
+             t.stride(2) == h * d &&
+             t.stride(0) == s * h * d;
+}
+
 // Logical tensor shape expected by the Python API is [B, H, S, D].
 //
 // Packed BHSD:
@@ -201,39 +231,8 @@ inline bool has_supported_base_stride(const at::Tensor &t) {
 //   q_view = q_bshd.permute(0, 2, 1, 3)
 //
 // No contiguous conversion is needed for q_view.
-inline bool can_use_direct_q_stride_path(const at::Tensor &t) {
-      if (!has_supported_base_stride(t)) {
-            return false;
-      }
-
-      const int64_t d = t.size(3);
-      const int64_t s = t.size(2);
-      const int64_t h = t.size(1);
-      bool const packed_bhsd =
-          t.stride(2) == d &&
-          t.stride(1) == s * d &&
-          t.stride(0) == h * s * d;
-
-      bool const packed_bshd_view =
-          t.stride(1) == d &&
-          t.stride(2) == h * d &&
-          t.stride(0) == s * h * d;
-
-      return packed_bhsd || packed_bshd_view;
-}
-
-inline bool can_use_direct_bhsd_stride_path(const at::Tensor &t) {
-      if (!has_supported_base_stride(t)) {
-            return false;
-      }
-
-      const int64_t d = t.size(3);
-      const int64_t s = t.size(2);
-      const int64_t h = t.size(1);
-
-      return t.stride(2) == d &&
-             t.stride(1) == s * d &&
-             t.stride(0) == h * s * d;
+inline bool can_use_direct_stride_path(const at::Tensor &t) {
+      return is_packed_bhsd(t) || is_packed_bshd_view(t);
 }
 
 at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
@@ -256,8 +255,22 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
                         q.size(3) > 0,
                   "q dimensions must be non-zero");
 
-      auto out = torch::empty({q.size(0), q.size(1), q.size(2), v.size(3)},
-                                                                              q.options().dtype(at::kFloat));
+      const bool useBshdOutput =
+            is_packed_bshd_view(q) &&
+            is_packed_bshd_view(k) &&
+            is_packed_bshd_view(v);
+
+      at::Tensor out;
+      if (useBshdOutput) {
+            out = torch::empty(
+                  {q.size(0), q.size(2), q.size(1), v.size(3)},
+                  q.options().dtype(at::kFloat)).permute({0, 2, 1, 3});
+      } else {
+            out = torch::empty(
+                  {q.size(0), q.size(1), q.size(2), v.size(3)},
+                  q.options().dtype(at::kFloat));
+      }
+
       TORCH_CHECK(out.device() == q.device(),
                                   "out must be on the same XPU device as q");
       TORCH_CHECK(out.scalar_type() == at::kFloat,
@@ -270,15 +283,16 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
 
       bool useDirectStrides =
             verify == 0 &&
-            can_use_direct_q_stride_path(q) &&
-            can_use_direct_bhsd_stride_path(k) &&
-            can_use_direct_bhsd_stride_path(v) &&
-            can_use_direct_bhsd_stride_path(out);
+	    can_use_direct_stride_path(q) &&
+            can_use_direct_stride_path(k) &&
+            can_use_direct_stride_path(v) &&
+            can_use_direct_stride_path(out);
 
       at::Tensor qTensor = useDirectStrides ? q : (q.is_contiguous() ? q : q.contiguous());
       at::Tensor kTensor = useDirectStrides ? k : (k.is_contiguous() ? k : k.contiguous());
       at::Tensor vTensor = useDirectStrides ? v : (v.is_contiguous() ? v : v.contiguous());
-      TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+      TORCH_CHECK(useDirectStrides || out.is_contiguous(),
+                  "fallback output must be contiguous");
 
       const int64_t batch = qTensor.size(0);
       const int64_t numHeadsQ = qTensor.size(1);
@@ -307,12 +321,17 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
               headSizeVO);
       TORCH_CHECK(out.size(0) == batch && out.size(1) == numHeadsQ &&
                     out.size(2) == seqLenQO && out.size(3) == headSizeVO,
-                    "out shape must be [batch, num_heads_q, seq_len_qo, head_size_vo]");
+		    "out logical shape must be "
+                    "[batch, num_heads_q, seq_len_qo, head_size_vo]");
 
-      std::array<int64_t, 3> qStrides{qTensor.stride(2), qTensor.stride(1), qTensor.stride(0)};
-      std::array<int64_t, 3> kStrides{kTensor.stride(2), kTensor.stride(1), kTensor.stride(0)};
-      std::array<int64_t, 3> vStrides{vTensor.stride(2), vTensor.stride(1), vTensor.stride(0)};
-      std::array<int64_t, 3> oStrides{out.stride(2), out.stride(1), out.stride(0)};
+      std::array<int64_t, 3> qStrides{
+            qTensor.stride(2), qTensor.stride(1), qTensor.stride(0)};
+      std::array<int64_t, 3> kStrides{
+            kTensor.stride(2), kTensor.stride(1), kTensor.stride(0)};
+      std::array<int64_t, 3> vStrides{
+            vTensor.stride(2), vTensor.stride(1), vTensor.stride(0)};
+      std::array<int64_t, 3> oStrides{
+            out.stride(2), out.stride(1), out.stride(0)};
 
       const int ret = prefillBf16Impl(
             static_cast<int>(batch), static_cast<int>(numHeadsQ),
@@ -327,6 +346,43 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
             useDirectStrides ? oStrides.data() : nullptr);
       TORCH_CHECK(ret == 0, "prefill_bf16_tensor failed in kernel run");
   return out;
+}
+
+// Native BSHD entry point.
+//
+// Inputs:
+//   q: [B,Sq,Hq,Dqk]
+//   k: [B,Sk,Hkv,Dqk]
+//   v: [B,Sk,Hkv,Dvo]
+//
+// Output:
+//   o: [B,Sq,Hq,Dvo], physically contiguous BSHD.
+//
+// permute() only creates metadata views. No Q/K/V/O data conversion or
+// contiguous copy is performed on the supported direct-stride path.
+at::Tensor prefillBf16TensorBSHD(
+      const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+      bool isCausal = false, int iterations = 1, int warmup = 0,
+      int verify = 0) {
+      TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                  "q, k, v must be rank-4 BSHD tensors");
+      TORCH_CHECK(q.is_contiguous(),
+                  "q must be contiguous in [B,S,H,D] layout");
+      TORCH_CHECK(k.is_contiguous(),
+                  "k must be contiguous in [B,S,H,D] layout");
+      TORCH_CHECK(v.is_contiguous(),
+                  "v must be contiguous in [B,S,H,D] layout");
+
+      auto outBhsdView = prefillBf16Tensor(
+            q.permute({0, 2, 1, 3}),
+            k.permute({0, 2, 1, 3}),
+            v.permute({0, 2, 1, 3}),
+            isCausal, iterations, warmup, verify);
+
+      auto outBshd = outBhsdView.permute({0, 2, 1, 3});
+      TORCH_CHECK(outBshd.is_contiguous(),
+                  "internal BSHD output must be contiguous");
+      return outBshd;
 }
 
 int prefillBf16Benchmark(int batch = 32, int numHeadsQ = 16, int numHeadsKV = 16,
@@ -358,6 +414,14 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
 
   m.def("prefill_bf16_tensor", &prefillBf16Tensor,
         "Run BMG flash-attention with torch.bfloat16 XPU tensors",
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("is_causal") = false,
+        py::arg("iterations") = 1,
+        py::arg("warmup") = 0,
+        py::arg("verify") = 0);
+  m.def("prefill_bf16_bshd", &prefillBf16TensorBSHD,
+        "Run BMG flash-attention with contiguous [B,S,H,D] "
+        "torch.bfloat16 XPU tensors and return contiguous [B,S,H,D] output",
         py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("is_causal") = false,
         py::arg("iterations") = 1,
