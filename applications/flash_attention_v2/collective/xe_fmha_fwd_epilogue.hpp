@@ -103,9 +103,14 @@ public:
   using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
   using TiledCopyO = conditional_t<is_void_v<TiledCopyO_>, DefaultTiledCopyO, TiledCopyO_>;
 
-  // Stateless design -- no arguments or parameters.
-  struct Arguments {};
-  struct Params {};
+  struct Arguments {
+    ElementA* lse = nullptr;
+    int stride_lse_q = 0;
+    int stride_lse_h = 0;
+    int stride_lse_b = 0;
+    bool accumulate = false;
+  };
+  using Params = Arguments;
 
   // Shared memory storage
   // Note sum/max tiles are padded to 16 elements, due to limitations in CuTe block load infrastructure.
@@ -125,7 +130,7 @@ private:
 public:
   static constexpr
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
-    return {};
+    return args;
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -133,7 +138,8 @@ public:
   }
 
   CUTLASS_HOST_DEVICE
-  FMHAFwdEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
+  FMHAFwdEpilogue(Params const& params_, SharedStorage& shared_)
+      : shared(shared_), params(params_) {}
 
   template <typename QVCoord>
   CUTLASS_DEVICE
@@ -143,21 +149,27 @@ public:
              FragARow       & tA_max,   // Softmax row-wise max accumulator
              FragARow       & tA_sum,   // Softmax row-wise sum accumulator
              QVCoord          blk_qv,   // WG tile indices: (q,v)
-             int              thr_id) { // Work-item ID
+             int              thr_id,   // Work-item ID
+             int              head_q,
+             int              idx_b) {
 
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_sum, rA_max, active] =
+        reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Complete softmax, dividing out sums. */
+    auto rA_lse = rA_sum;
+    constexpr ElementA kLn2 = ElementA(0.6931471805599453094);
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
+    for (int i = 0; i < rA_sum.size(); i++) {
+      rA_lse(i) = (rA_max(i) + sycl::log2(rA_sum(i))) * kLn2;
       rA_sum(i) = ElementA(1) / rA_sum(i);
+    }
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++)
@@ -174,9 +186,55 @@ public:
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
-    /* Reorder tile and write out */
+    auto rA_lse_broadcast = rA;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_lse_broadcast.size(); i++)
+      rA_lse_broadcast(i) = broadcast<0>(rA_lse, rA_lse_broadcast, i);
+
     reorder(rA, tOrO);
+    auto tOrLSE = make_fragment_like(tOrO);
+    reorder(rA_lse_broadcast, tOrLSE);
+
+    if (params.accumulate) {
+      auto tOrOldO = make_fragment_like(tOrO);
+      copy(copy_o, tOgO, tOrOldO);
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tOrO.size(); i++) {
+        auto coord = tOgO(i);
+        int q = get<0>(coord);
+        int lse_idx = q * params.stride_lse_q +
+                      head_q * params.stride_lse_h +
+                      idx_b * params.stride_lse_b;
+        ElementA old_lse = params.lse[lse_idx];
+        ElementA partial_lse = tOrLSE(i);
+        ElementA merged_lse = sycl::max(old_lse, partial_lse);
+        ElementA old_weight = sycl::exp(old_lse - merged_lse);
+        ElementA partial_weight = sycl::exp(partial_lse - merged_lse);
+        ElementA inv_sum = ElementA(1) / (old_weight + partial_weight);
+        tOrO(i) = (old_weight * tOrOldO(i) +
+                   partial_weight * tOrO(i)) * inv_sum;
+        tOrLSE(i) = merged_lse -
+                    sycl::log(inv_sum);
+      }
+    }
+
     copy(copy_o, tOrO, tOgO);
+
+    if (params.lse) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tOrO.size(); i++) {
+        auto coord = tOgO(i);
+        int q = get<0>(coord);
+        int v = get<1>(coord);
+        if (v == 0 && q < size<0>(O)) {
+          int lse_idx = q * params.stride_lse_q +
+                        head_q * params.stride_lse_h +
+                        idx_b * params.stride_lse_b;
+          params.lse[lse_idx] = tOrLSE(i);
+        }
+      }
+    }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.
@@ -193,7 +251,7 @@ public:
     using namespace sycl::ext::oneapi::this_work_item;
 
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_sum, tA_max, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1,3>(TiledMMAPV{}.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
@@ -285,9 +343,12 @@ public:
           }
         }
       }
-      return std::make_tuple(rA, rA_sum, active);
+      return std::make_tuple(rA, rA_sum, rA_max, active);
     }
   }
+
+private:
+  Params params;
 };
 
 
