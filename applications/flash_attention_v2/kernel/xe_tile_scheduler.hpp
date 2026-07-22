@@ -40,6 +40,83 @@
 
 namespace cutlass::fmha::kernel {
 
+// Scheduler specialized for Q stored as BSHD. Flatten (batch, q tile, head)
+// so adjacent work-groups consume adjacent heads from the same token range.
+struct XeFMHABSHDIndividualTileScheduler {
+
+  struct Params {
+    dim3 grid;
+    FastDivmod divmod_num_heads;
+    FastDivmod divmod_num_q_tiles;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XeFMHABSHDIndividualTileScheduler(Params const& params_)
+      : params(params_) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape,
+      KernelHardwareInfo hw_info,
+      TileShape const& tile_shape)
+  {
+    using namespace cute;
+    (void)hw_info;
+
+    int const num_v_tiles =
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape)));
+    int const num_q_tiles =
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape)));
+    int const num_q_head_batch_tiles =
+        shape.batch * num_q_tiles * shape.num_heads_q;
+
+    return Params{
+        dim3(num_v_tiles, num_q_head_batch_tiles, 1),
+        FastDivmod(shape.num_heads_q),
+        FastDivmod(num_q_tiles)
+    };
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+
+    int linear = int(BlockIdxY());
+
+    // linear = q_batch * num_heads_q + head_q
+    int head_q;
+    int q_batch;
+    params.divmod_num_heads(linear, head_q, q_batch);
+
+    // q_batch = idx_b * num_q_tiles + blk_q
+    int blk_q;
+    int idx_b;
+    params.divmod_num_q_tiles(q_batch, blk_q, idx_b);
+
+    int const blk_v = int(BlockIdxX());
+    return make_coord(blk_q, blk_v, head_q, idx_b);
+  }
+
+  CUTLASS_DEVICE
+  XeFMHABSHDIndividualTileScheduler& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
 struct XeFHMAIndividualTileScheduler {
 
   struct Params {

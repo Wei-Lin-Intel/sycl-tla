@@ -36,9 +36,19 @@ template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
           typename SubgroupLayoutQK>
 int runPrefill(const Options &options) {
   constexpr int PipelineStages = 2;
-  return FMHAConfig<Causal, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK, void,
-                    PipelineStages, false, bfloat16_t, bfloat16_t,
-                    bfloat16_t>::run(options);
+  using Config =
+      FMHAConfig<Causal, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
+                 void, PipelineStages, false,
+                 bfloat16_t, bfloat16_t, bfloat16_t>;
+
+  using Scheduler =
+      cutlass::fmha::kernel::XeFMHABSHDIndividualTileScheduler;
+
+  // The Python tensor entry point currently supports fixed-length,
+  // non-cached, non-paged prefill. Select the BSHD scheduler directly
+  // instead of going through FMHAConfig::run(), which selects the default
+  // individual scheduler.
+  return Config::template run<false, false, false, Scheduler>(options);
 }
 
 int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
@@ -54,6 +64,13 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     const int64_t *oStrides = nullptr) {
   if (headSizeVO != 64 && headSizeVO != 96 && headSizeVO != 128 &&
       headSizeVO != 192) {
+    return -1;
+  }
+
+  // The current Q*K mainloop has no remainder masking in the head dimension.
+  // All Python configurations below use a 32-element Q*K K tile.
+  // This permits Q/K head_dim=192 independently of V/O head_dim=128.
+  if (headSizeQK <= 0 || headSizeQK % 32 != 0) {
     return -1;
   }
 
@@ -152,7 +169,7 @@ inline bool stride_fits_int64_to_int(int64_t value) {
                          value <= std::numeric_limits<int>::max();
 }
 
-inline bool can_use_direct_stride_path(const at::Tensor &t) {
+inline bool has_supported_base_stride(const at::Tensor &t) {
       if (t.dim() != 4) {
             return false;
       }
@@ -165,23 +182,58 @@ inline bool can_use_direct_stride_path(const at::Tensor &t) {
             }
       }
 
-      // The FMHA kernels are tuned for packed BHSD memory access. Allowing arbitrary
-      // strided layouts can remove explicit copies but often hurts kernel throughput.
-      // Enable direct stride path only when layout is packed-compatible.
-      const int64_t d = t.size(3);
-      const int64_t s = t.size(2);
-      const int64_t h = t.size(1);
-      if (t.stride(2) != d) {
-            return false;
-      }
-      if (t.stride(1) != s * d) {
-            return false;
-      }
-      if (t.stride(0) != h * s * d) {
+      return true;
+}
+
+// Logical tensor shape expected by the Python API is [B, H, S, D].
+//
+// Packed BHSD:
+//   stride = [H*S*D, S*D, D, 1]
+//
+// BSHD-backed BHSD view:
+//   physical storage: [B, S, H, D]
+//   logical view:     [B, H, S, D]
+//   stride = [S*H*D, D, H*D, 1]
+//
+// The latter is produced, for example, by:
+//
+//   q_bshd = torch.empty([B, S, H, D], ...)
+//   q_view = q_bshd.permute(0, 2, 1, 3)
+//
+// No contiguous conversion is needed for q_view.
+inline bool can_use_direct_q_stride_path(const at::Tensor &t) {
+      if (!has_supported_base_stride(t)) {
             return false;
       }
 
-      return true;
+      const int64_t d = t.size(3);
+      const int64_t s = t.size(2);
+      const int64_t h = t.size(1);
+      bool const packed_bhsd =
+          t.stride(2) == d &&
+          t.stride(1) == s * d &&
+          t.stride(0) == h * s * d;
+
+      bool const packed_bshd_view =
+          t.stride(1) == d &&
+          t.stride(2) == h * d &&
+          t.stride(0) == s * h * d;
+
+      return packed_bhsd || packed_bshd_view;
+}
+
+inline bool can_use_direct_bhsd_stride_path(const at::Tensor &t) {
+      if (!has_supported_base_stride(t)) {
+            return false;
+      }
+
+      const int64_t d = t.size(3);
+      const int64_t s = t.size(2);
+      const int64_t h = t.size(1);
+
+      return t.stride(2) == d &&
+             t.stride(1) == s * d &&
+             t.stride(0) == h * s * d;
 }
 
 at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
@@ -200,6 +252,9 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
                                   "v must have bfloat16 dtype");
       TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                                           "q, k, v must be rank-4 tensors");
+      TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) > 0 &&
+                        q.size(3) > 0,
+                  "q dimensions must be non-zero");
 
       auto out = torch::empty({q.size(0), q.size(1), q.size(2), v.size(3)},
                                                                               q.options().dtype(at::kFloat));
@@ -214,9 +269,11 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
       CompatDeviceGuard device_guard(static_cast<unsigned int>(tensor_device_index));
 
       bool useDirectStrides =
-            verify == 0 && can_use_direct_stride_path(q) &&
-            can_use_direct_stride_path(k) && can_use_direct_stride_path(v) &&
-            can_use_direct_stride_path(out);
+            verify == 0 &&
+            can_use_direct_q_stride_path(q) &&
+            can_use_direct_bhsd_stride_path(k) &&
+            can_use_direct_bhsd_stride_path(v) &&
+            can_use_direct_bhsd_stride_path(out);
 
       at::Tensor qTensor = useDirectStrides ? q : (q.is_contiguous() ? q : q.contiguous());
       at::Tensor kTensor = useDirectStrides ? k : (k.is_contiguous() ? k : k.contiguous());
@@ -235,10 +292,19 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
               "k/v batch dimension must match q");
       TORCH_CHECK(kTensor.size(3) == headSizeQK,
               "k last dimension must equal q last dimension (head_size_qk)");
+      TORCH_CHECK(headSizeQK % 32 == 0,
+              "q/k head dimension must be a positive multiple of 32, but got ",
+              headSizeQK);
       TORCH_CHECK(vTensor.size(1) == numHeadsKV && vTensor.size(2) == seqLenKV,
               "v must match k in num_heads_kv and seq_len_kv");
+      TORCH_CHECK(numHeadsKV > 0 && numHeadsQ % numHeadsKV == 0,
+              "num_heads_q must be divisible by num_heads_kv");
 
       const int64_t headSizeVO = vTensor.size(3);
+      TORCH_CHECK(headSizeVO == 64 || headSizeVO == 96 ||
+                        headSizeVO == 128 || headSizeVO == 192,
+              "v head dimension must be one of 64, 96, 128, or 192, but got ",
+              headSizeVO);
       TORCH_CHECK(out.size(0) == batch && out.size(1) == numHeadsQ &&
                     out.size(2) == seqLenQO && out.size(3) == headSizeVO,
                     "out shape must be [batch, num_heads_q, seq_len_qo, head_size_vo]");

@@ -1065,7 +1065,8 @@ struct FMHAConfig {
     } else if(!options.use_paged_kv && options.varlen && !cached_kv) {
       return run<true, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else if(!options.use_paged_kv && !options.varlen && !cached_kv) {
-      return run<false, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
+//      return run<false, false, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
+      return run<false, false, false, cutlass::fmha::kernel::XeFMHABSHDIndividualTileScheduler>(options);
     } else if (!options.use_paged_kv && options.varlen && cached_kv) {
       return run<true, true, false, cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>(options);
     } else if (!options.use_paged_kv && !options.varlen && cached_kv) {
