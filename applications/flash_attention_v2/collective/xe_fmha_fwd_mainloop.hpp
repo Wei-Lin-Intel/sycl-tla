@@ -116,6 +116,24 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   using TensorV_cache2D = decltype(TensorV_cache_{}(append<rank_v<TensorV_cache_>>(make_coord(_,_),0)));
   using TiledCopyK_cache = conditional_t<is_void_v<TiledCopyK_cache_>, decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK_cache2D{})), TiledCopyK_cache_>;
   using TiledCopyV_cache = conditional_t<is_void_v<TiledCopyV_cache_>, decltype(make_block_2d_copy_B(TiledMMAPV{}, TensorV_cache2D{})), TiledCopyV_cache_>;
+  //
+  // Q SLM cache
+  //
+  // Q is invariant across the blocked-K loop. Load it from global memory during
+  // the first K block, use that register fragment immediately, and retain a copy
+  // in SLM for all following K blocks.
+  //
+  // The current FMHA configurations support head dimensions up to 192. Keep a
+  // little room for experimental configurations; increase this value if needed.
+  static constexpr int MaxHeadDimQK = 128;
+  static constexpr int QSLMStages =
+      cute::ceil_div(MaxHeadDimQK, get<2>(TileShapeQK{}));
+
+  using QSLMCopies = decltype(make_A_slm_copies(TiledMMAQK{}, TiledCopyQ{}));
+  using QRegToSLMCopy = std::tuple_element_t<0, QSLMCopies>;
+  using ElementQSLM = typename TiledMMAQK::ValTypeA;
+  using QSLMLayout = decltype(make_layout(
+      append<3>(typename QRegToSLMCopy::Tiler_MN{}, Int<QSLMStages>{})));
 
   // TODO: static_asserts on TiledMMAPV here...
 
@@ -157,16 +175,20 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   // Kernel-facing parameters
   using Params = Arguments;
 
-  // SLM data
-  struct SharedStorage {};
+  // SLM data. Q is stored in the MMA input type after reorder/conversion.
+  struct SharedStorage {
+    alignas(64) ElementQSLM q[size(QSLMLayout{})];
+  };
 
   Params params;
+  SharedStorage& shared_storage;
 
   //
   // Methods
   //
 
-  FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloop(Params const& params_, SharedStorage& shared_storage_)
+      : params(params_), shared_storage(shared_storage_) {}
 
   static constexpr
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
@@ -257,6 +279,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
 
+    /* Create register <-> SLM copies for the reusable Q tile */
+    auto [copy_q_r2s, copy_q_s2r] = make_A_slm_copies(mma_qk, copy_q);
+    Tensor sQ = make_tensor(
+        make_smem_ptr(shared_storage.q),
+        QSLMLayout{});
+
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_q = copy_q.get_slice(thr_id);
     auto thr_copy_k = copy_k.get_slice(thr_id);
@@ -265,6 +293,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     auto thr_copy_v_cache = copy_v_cache.get_slice(thr_id);
     auto thr_mma_qk = mma_qk.get_slice(thr_id);
     auto thr_mma_pv = mma_pv.get_slice(thr_id);
+    auto thr_copy_q_r2s = copy_q_r2s.get_slice(thr_id);
+    auto thr_copy_q_s2r = copy_q_s2r.get_slice(thr_id);
 
     /* Partition coordinate tensors for copy */
     auto tQgQ = thr_copy_q.partition_S(gQ);                // (atom_val,q',d',D)
@@ -276,6 +306,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     /* Create register fragments for MMA and copies */
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
+
+    auto tQsQ_out = thr_copy_q_r2s.partition_D(sQ);
+    auto tQsQ_in = thr_copy_q_s2r.partition_S(sQ);
+    // r2s consumes the reordered MMA-typed fragment; s2r produces it directly.
+    auto tSrQ_r2s = thr_copy_q_r2s.retile_S(tSrQ);
+    auto tSrQ_s2r = thr_copy_q_s2r.retile_D(tSrQ);
 
     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
@@ -334,13 +370,17 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     /* Check if */
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 
+    // Uniform across the workgroup because every work-item follows the same
+    // blocked-K loop. Once true, Q remains read-only in SLM.
+    bool q_slm_ready = false;
+
     /* Main loop body */
     auto mainloop_body = [&](auto cached_k, int K,
                             auto& copy_k_cur, auto& copy_v_cur,
                             auto& prefetch_v_cur, auto& tKgK_cur,
                             auto& tVgV_cur, auto& pVgV_cur) {
-      /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
+      bool publish_q_this_iteration = !q_slm_ready;
+
       constexpr bool is_cache = decltype(cached_k)::value;
 
       int k_idx;
@@ -353,16 +393,45 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
         k_idx = K - kblocks_cache;
       }
 
+      // The original loop uses a split barrier to keep work-items together.
+      // On the first iteration, delay the arrive until after Q has been written
+      // to SLM so that the release operation publishes those stores.
+      if (q_slm_ready) {
+        barrier_arrive(ScopeWorkgroup);
+      }
+
       /* GEMM 1: S = K * Q */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
-        copy(copy_q, tQgQ(_,_,_,D), tQrQ);
         copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
-        reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
 
+        if (!q_slm_ready) {
+          // First K block:
+          //   global Q -> registers -> MMA layout
+          //   MMA-layout registers -> SLM
+          //   use the same registers immediately for the current GEMM
+          copy(copy_q, tQgQ(_,_,_,D), tQrQ);
+          reorder(tQrQ, tSrQ);
+          copy(copy_q_r2s, tSrQ_r2s, tQsQ_out(_,_,_,D));
+        } else {
+          // Remaining K blocks read the immutable Q tile from SLM.
+          copy(copy_q_s2r, tQsQ_in(_,_,_,D), tSrQ_s2r);
+        }
+
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+      }
+
+      if (publish_q_this_iteration) {
+        // Publish the complete Q tile only after all D slices have been stored.
+        // The first GEMM has already consumed its register source, so it did
+        // not need to wait for SLM.
+        barrier_arrive(
+            SPIRVScope::ScopeWorkgroup,
+            SPIRVMemorySemantics::SemanticsRelease |
+                SPIRVMemorySemantics::SemanticsWGMemory);
+        q_slm_ready = true;
       }
 
       /* V prefetch for GEMM 2 */
@@ -443,7 +512,14 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
           prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
         }
       }
-      barrier_wait(ScopeWorkgroup);
+      if (publish_q_this_iteration) {
+        barrier_wait(
+            SPIRVScope::ScopeWorkgroup,
+            SPIRVMemorySemantics::SemanticsAcquire |
+                SPIRVMemorySemantics::SemanticsWGMemory);
+      } else {
+        barrier_wait(ScopeWorkgroup);
+      }
     };
 
     /* Main loop, blocked in k. */
