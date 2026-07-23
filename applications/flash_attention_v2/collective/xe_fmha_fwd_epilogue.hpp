@@ -219,7 +219,7 @@ public:
     if constexpr (Mode != FMHAFwdEpilogueMode::Plain) {
       using OutputRowFragment =
           decltype(reduce<1>(tOrO, sycl::plus<void>{}));
-      static_assert(size(OutputRowFragment{}) == 1,
+      static_assert(size(typename OutputRowFragment::layout_type{}) == 1,
                     "LSE row mapping expects one row per work-item");
       OutputRowFragment rOLSE;
       reorder(rA_lse, rOLSE);
