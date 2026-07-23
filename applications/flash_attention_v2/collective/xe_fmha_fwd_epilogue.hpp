@@ -47,10 +47,17 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
+enum class FMHAFwdEpilogueMode {
+  Plain,
+  Initialize,
+  Accumulate
+};
+
 template <class CollectiveMainloop, // Attention mainloop
           class TileShapeO_,        // Shape of output tile, may be larger than P*V GEMM
           class TensorO_,           // 2D slice of global output tensor
-          class TiledCopyO_ = void> // Optional TiledCopy for loading O
+          class TiledCopyO_ = void, // Optional TiledCopy for loading O
+          FMHAFwdEpilogueMode Mode_ = FMHAFwdEpilogueMode::Plain>
 class FMHAFwdEpilogue {
 
 public:
@@ -111,14 +118,17 @@ public:
   }
 
   using TiledLoadO = decltype(default_tiled_load_O_helper());
+  static constexpr FMHAFwdEpilogueMode Mode = Mode_;
 
-  struct Arguments {
+  struct LSEArguments {
     ElementA* lse = nullptr;
     int stride_lse_q = 0;
     int stride_lse_h = 0;
     int stride_lse_b = 0;
-    bool accumulate = false;
   };
+  struct PlainArguments {};
+  using Arguments = conditional_t<Mode == FMHAFwdEpilogueMode::Plain,
+                                  PlainArguments, LSEArguments>;
   using Params = Arguments;
 
   // Shared memory storage
@@ -143,7 +153,10 @@ public:
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
-    return !args.accumulate || args.lse;
+    if constexpr (Mode == FMHAFwdEpilogueMode::Plain)
+      return true;
+    else
+      return args.lse != nullptr;
   }
 
   CUTLASS_HOST_DEVICE
@@ -172,11 +185,17 @@ public:
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    auto rA_lse = rA_sum;
-    constexpr ElementA kLn2 = ElementA(0.6931471805599453094);
+    [[maybe_unused]] auto rA_lse = rA_sum;
+    if constexpr (Mode != FMHAFwdEpilogueMode::Plain) {
+      constexpr ElementA kLn2 = ElementA(0.6931471805599453094);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++) {
+        rA_lse(i) = (rA_max(i) + sycl::log2(rA_sum(i))) * kLn2;
+      }
+    }
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
-      rA_lse(i) = (rA_max(i) + sycl::log2(rA_sum(i))) * kLn2;
       rA_sum(i) = ElementA(1) / rA_sum(i);
     }
 
@@ -195,16 +214,45 @@ public:
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
-    auto rA_lse_broadcast = rA;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_lse_broadcast.size(); i++)
-      rA_lse_broadcast(i) = broadcast<0>(rA_lse, rA_lse_broadcast, i);
-
     reorder(rA, tOrO);
-    auto tOrLSE = make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
-    reorder(rA_lse_broadcast, tOrLSE);
 
-    if (params.accumulate) {
+    if constexpr (Mode != FMHAFwdEpilogueMode::Plain) {
+      using OutputRowFragment =
+          decltype(reduce<1>(tOrO, sycl::plus<void>{}));
+      OutputRowFragment rOLSE;
+      reorder(rA_lse, rOLSE);
+
+      auto rOAlpha = rOLSE;
+      auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+      int lane = sg.get_local_linear_id();
+      int q_tile = get<0>(blk_qv) * get<0>(TileShapeO{});
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rOLSE.size(); i++) {
+        auto coord = rOLSE.tv_layout()(lane, i);
+        int q = q_tile + get<0>(coord);
+        if (q >= size<0>(O)) {
+          continue;
+        }
+
+        int lse_idx = q * params.stride_lse_q +
+                      head_q * params.stride_lse_h +
+                      idx_b * params.stride_lse_b;
+
+        if constexpr (Mode == FMHAFwdEpilogueMode::Initialize) {
+          params.lse[lse_idx] = rOLSE(i);
+        } else {
+          ElementA old_lse = params.lse[lse_idx];
+          ElementA merged_lse = sycl::max(old_lse, rOLSE(i));
+          ElementA old_weight = sycl::exp(old_lse - merged_lse);
+          ElementA partial_weight = sycl::exp(rOLSE(i) - merged_lse);
+          ElementA inv_sum = ElementA(1) / (old_weight + partial_weight);
+          rOAlpha(i) = old_weight * inv_sum;
+          params.lse[lse_idx] = merged_lse - sycl::log(inv_sum);
+        }
+      }
+
+      if constexpr (Mode == FMHAFwdEpilogueMode::Accumulate) {
       TiledLoadO load_o{O};
       auto thr_load_o = load_o.get_slice(thr_id);
       auto tOgOldO = thr_load_o.partition_S(gO);
@@ -218,38 +266,13 @@ public:
         if (q >= size<0>(O)) {
           continue;
         }
-        int lse_idx = q * params.stride_lse_q +
-                      head_q * params.stride_lse_h +
-                      idx_b * params.stride_lse_b;
-        ElementA old_lse = params.lse[lse_idx];
-        ElementA partial_lse = tOrLSE(i);
-        ElementA merged_lse = sycl::max(old_lse, partial_lse);
-        ElementA old_weight = sycl::exp(old_lse - merged_lse);
-        ElementA partial_weight = sycl::exp(partial_lse - merged_lse);
-        ElementA inv_sum = ElementA(1) / (old_weight + partial_weight);
-        tOrO(i) = (old_weight * tOrOldO(i) +
-                   partial_weight * tOrO(i)) * inv_sum;
-        tOrLSE(i) = merged_lse -
-                    sycl::log(inv_sum);
+        ElementA alpha = broadcast<0>(rOAlpha, tOrO, i);
+        tOrO(i) = alpha * tOrOldO(i) + (ElementA(1) - alpha) * tOrO(i);
+      }
       }
     }
 
     copy(copy_o, tOrO, tOgO);
-
-    if (params.lse) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tOrO.size(); i++) {
-        auto coord = tOgO(i);
-        int q = get<0>(coord);
-        int v = get<1>(coord);
-        if (v == 0 && q < size<0>(O)) {
-          int lse_idx = q * params.stride_lse_q +
-                        head_q * params.stride_lse_h +
-                        idx_b * params.stride_lse_b;
-          params.lse[lse_idx] = tOrLSE(i);
-        }
-      }
-    }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.

@@ -35,7 +35,8 @@ private:
 };
 
 template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
-          typename SubgroupLayoutQK>
+          typename SubgroupLayoutQK,
+          cutlass::fmha::collective::FMHAFwdEpilogueMode EpilogueMode>
 int runPrefill(const Options &options) {
   constexpr int PipelineStages = 2;
   using Config =
@@ -50,9 +51,12 @@ int runPrefill(const Options &options) {
   // non-cached, non-paged prefill. Select the BSHD scheduler directly
   // instead of going through FMHAConfig::run(), which selects the default
   // individual scheduler.
-  return Config::template run<false, false, false, Scheduler>(options);
+  return Config::template run<false, false, false, Scheduler, EpilogueMode>(
+      options);
 }
 
+template <cutlass::fmha::collective::FMHAFwdEpilogueMode EpilogueMode =
+              cutlass::fmha::collective::FMHAFwdEpilogueMode::Plain>
 int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     int seqLenKV, int headSizeQK, int headSizeVO, bool isCausal,
                     int iterations, int warmup, int verify,
@@ -65,7 +69,6 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     const int64_t *vStrides = nullptr,
                     const int64_t *oStrides = nullptr,
                     float *externalLSE = nullptr,
-                    bool accumulateOutput = false,
                     const int64_t *lseStrides = nullptr) {
   if (headSizeVO != 64 && headSizeVO != 96 && headSizeVO != 128 &&
       headSizeVO != 192) {
@@ -106,7 +109,6 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   options.external_v = externalV;
   options.external_o = externalO;
   options.external_lse = externalLSE;
-  options.accumulate_output = accumulateOutput;
 
   if (externalLSE && lseStrides) {
     options.stride_lse_q = static_cast<int>(lseStrides[0]);
@@ -136,10 +138,11 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _64>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
+               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
+                           EpilogueMode>(
                      options)
                : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+                            SubgroupLayoutQK, EpilogueMode>(options);
   }
 
   if (headSizeVO == 96) {
@@ -148,10 +151,11 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _96>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
+               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
+                           EpilogueMode>(
                      options)
                : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+                            SubgroupLayoutQK, EpilogueMode>(options);
   }
 
   if (headSizeVO == 128) {
@@ -160,10 +164,11 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _128>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
+               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
+                           EpilogueMode>(
                      options)
                : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+                            SubgroupLayoutQK, EpilogueMode>(options);
   }
 
   using ShapeQK = Shape<_256, _64, _32>;
@@ -171,10 +176,11 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   using ShapeOut = Shape<_256, _192>;
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
   return isCausal
-             ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
+             ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
+                         EpilogueMode>(
                    options)
-             : runPrefill<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                   options);
+             : runPrefill<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
+                         EpilogueMode>(options);
 }
 
 inline bool stride_fits_int64_to_int(int64_t value) {
@@ -498,17 +504,27 @@ py::object prefillBf16TensorBSHDKVList(
             std::array<int64_t, 3> vStrides{
                   vView.stride(2), vView.stride(1), vView.stride(0)};
 
-            const int ret = prefillBf16Impl(
-                  static_cast<int>(q.size(0)), static_cast<int>(q.size(2)),
-                  static_cast<int>(firstK.size(2)),
-                  static_cast<int>(q.size(1)),
-                  static_cast<int>(firstK.size(1)),
-                  static_cast<int>(q.size(3)),
-                  static_cast<int>(headSizeVO), false, 1, 0, 0,
-                  qView.data_ptr(), kView.data_ptr(), vView.data_ptr(),
-                  outView.data_ptr<float>(), qStrides.data(), kStrides.data(),
-                  vStrides.data(), oStrides.data(), lse.data_ptr<float>(),
-                  i != 0, lseStrides.data());
+            auto runChunk = [&](auto mode) {
+                  return prefillBf16Impl<decltype(mode)::value>(
+                        static_cast<int>(q.size(0)),
+                        static_cast<int>(q.size(2)),
+                        static_cast<int>(firstK.size(2)),
+                        static_cast<int>(q.size(1)),
+                        static_cast<int>(firstK.size(1)),
+                        static_cast<int>(q.size(3)),
+                        static_cast<int>(headSizeVO), false, 1, 0, 0,
+                        qView.data_ptr(), kView.data_ptr(), vView.data_ptr(),
+                        outView.data_ptr<float>(), qStrides.data(),
+                        kStrides.data(), vStrides.data(), oStrides.data(),
+                        lse.data_ptr<float>(), lseStrides.data());
+            };
+            using EpilogueMode =
+                  cutlass::fmha::collective::FMHAFwdEpilogueMode;
+            const int ret = i == 0
+                  ? runChunk(std::integral_constant<
+                        EpilogueMode, EpilogueMode::Initialize>{})
+                  : runChunk(std::integral_constant<
+                        EpilogueMode, EpilogueMode::Accumulate>{});
             TORCH_CHECK(ret == 0,
                         "prefill_bf16_bshd_kv_list failed in kernel run");
       }
