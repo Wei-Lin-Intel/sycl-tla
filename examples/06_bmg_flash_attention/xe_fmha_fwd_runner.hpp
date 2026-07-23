@@ -818,15 +818,6 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       ? static_cast<ElementO *>(options.external_o)
       : block_O.get();
 
-    typename FMHAKernel::EpilogueArguments epilogue_arguments{};
-    if constexpr (FMHAKernel::CollectiveEpilogue::Mode !=
-                  cutlass::fmha::collective::FMHAFwdEpilogueMode::Plain) {
-      epilogue_arguments.lse = options.external_lse;
-      epilogue_arguments.stride_lse_q = options.stride_lse_q;
-      epilogue_arguments.stride_lse_h = options.stride_lse_h;
-      epilogue_arguments.stride_lse_b = options.stride_lse_b;
-    }
-
     typename FMHAKernel::Arguments arguments{
       {
         shape,
@@ -843,7 +834,13 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
         options.use_paged_kv ? paged_kv_cache.page_size : 0,
         options.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr
       },
-      epilogue_arguments,
+      {
+        options.external_lse,
+        options.stride_lse_q,
+        options.stride_lse_h,
+        options.stride_lse_b,
+        options.accumulate_output
+      },
       hw_info
     };
 
@@ -997,9 +994,7 @@ struct FMHAConfig {
                                                decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
                                                SubgroupLayoutPV_>;
 
-  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler,
-            cutlass::fmha::collective::FMHAFwdEpilogueMode EpilogueMode =
-                cutlass::fmha::collective::FMHAFwdEpilogueMode::Plain>
+  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
   static int run(const Options &options) {
     //
     // Run examples
@@ -1050,8 +1045,7 @@ struct FMHAConfig {
         CollectiveMainloop,
         TileShapeOutput,
         TensorO,
-        GmemTiledCopyO,
-        EpilogueMode
+        GmemTiledCopyO
     >;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
