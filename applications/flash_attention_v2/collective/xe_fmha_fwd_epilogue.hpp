@@ -204,12 +204,68 @@ public:
       reorder(rA, tOrO);
       copy(copy_o, tOrO, tOgO);
     } else {
+      // The row-coordinate mapping below uses the original P*V accumulator
+      // subgroup layout directly. The Python prefill configurations currently
+      // instantiate ReduceK == 1.
+      static_assert(ReduceK{} == _1{},
+                    "row-level LSE epilogue currently requires ReduceK == 1");
+
       auto rA_lse = rA_sum;
       constexpr ElementA kLn2 = ElementA(0.6931471805599453094);
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
         rA_lse(i) = (rA_max(i) + sycl::log2(rA_sum(i))) * kLn2;
         rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
+
+      // rA_lse is a subgroup row fragment. Its subgroup TV layout maps each
+      // physical (lane, local-value) pair to the corresponding logical query
+      // row in the output tile. Thus each row already has a unique physical
+      // owner; no expansion to a full [Q,V] fragment is necessary.
+      auto rA_alpha = rA_lse;
+
+      // reduce<1>() returns a compact row fragment without preserving the
+      // SubgroupTensor wrapper, so rA_lse has no tv_layout(). The reduction
+      // stores logical query rows linearly across the subgroup:
+      //
+      //   local row = local_value_index * subgroup_size + lane_id
+      //
+      // The P*V thread layout identifies which Q subgroup owns this fragment.
+      auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+      int lane_id = static_cast<int>(sg.get_local_id()[0]);
+      auto thr_mnk =
+          group<1,3>(TiledMMAPV{}.get_thr_layout_vmnk())
+              .get_flat_coord(assert_uniform(thr_id));
+      int q_sg = get<0>(thr_mnk);
+
+      if (params.accumulate) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA_lse.size(); ++i) {
+	  int q_in_sg =
+              i * cute::intel::sg_size + lane_id;
+          int q_in_tile =
+              q_sg * size<0>(SGTileShapeA{}) + q_in_sg;
+          int q = get<0>(blk_qv) * size<0>(TileShapeO{}) + q_in_tile;
+
+          if (q < size<0>(O)) {
+            int lse_idx = q * params.stride_lse_q +
+                          head_q * params.stride_lse_h +
+                          idx_b * params.stride_lse_b;
+
+            ElementA old_lse = params.lse[lse_idx];
+            ElementA partial_lse = rA_lse(i);
+            ElementA merged_max = sycl::max(old_lse, partial_lse);
+            ElementA old_weight =
+                sycl::native::exp(old_lse - merged_max);
+            ElementA partial_weight =
+                sycl::native::exp(partial_lse - merged_max);
+            ElementA inv_sum =
+                ElementA(1) / (old_weight + partial_weight);
+
+            rA_alpha(i) = old_weight * inv_sum;
+            rA_lse(i) = merged_max - sycl::native::log(inv_sum);
+          }
+        }
       }
 
       CUTLASS_PRAGMA_UNROLL
@@ -227,14 +283,9 @@ public:
       auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
       auto tOgO = thr_copy_o.partition_D(gO);
 
-      auto rA_lse_broadcast = rA;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < rA_lse_broadcast.size(); i++)
-        rA_lse_broadcast(i) = broadcast<0>(rA_lse, rA_lse_broadcast, i);
-
+      // Only the output accumulator is reordered. LSE remains in its compact
+      // row-fragment representation.
       reorder(rA, tOrO);
-      auto tOrLSE = make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
-      reorder(rA_lse_broadcast, tOrLSE);
 
       if (params.accumulate) {
         TiledLoadO load_o{O};
@@ -243,13 +294,9 @@ public:
         auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
         copy(load_o, tOgOldO, tOrOldO);
 
-        // LSE merge weights depend on q, but not on the V coordinate.
-        // Cache alpha and merged LSE for each query row represented by this
-        // work-item, avoiding repeated global LSE loads and exp/log operations
-        // for output elements belonging to the same row.
-        auto tOrAlpha =
-            make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
-
+	// Alpha is row-wise. Broadcast the compact row fragment directly into
+        // the output-store layout instead of materializing a full alpha or LSE
+        // output fragment.
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tOrO.size(); i++) {
           auto coord = tOgO(i);
@@ -258,49 +305,29 @@ public:
             continue;
           }
 
-          // Search earlier fragment entries owned by this work-item for the
-          // same query row. Reuse their row-wise alpha and merged LSE.
-          int previous = -1;
-          CUTLASS_PRAGMA_UNROLL
-          for (int j = 0; j < i; j++) {
-            auto previous_coord = tOgO(j);
-            if (get<0>(previous_coord) == q) {
-              previous = j;
-              break;
-            }
-          }
+	  // tOrO has a hierarchical TV layout, so cute::broadcast<0>() cannot
+          // index it as a simple (thread,value) layout. Derive the physical
+          // owner of this query row explicitly.
+          //
+          // rA_alpha is distributed linearly over the subgroup:
+          //
+          //   q_in_sg = local_value * SGSize + owner_lane
+          //
+          // Each lane indexes the same local-value slot, and group_broadcast
+          // selects the lane that owns the requested query row.
+          int q_tile_base =
+              get<0>(blk_qv) * size<0>(TileShapeO{});
+          int q_in_tile = q - q_tile_base;
+          int q_in_sg =
+              q_in_tile - q_sg * size<0>(SGTileShapeA{});
 
-          if (previous >= 0) {
-            tOrAlpha(i) = tOrAlpha(previous);
-            tOrLSE(i) = tOrLSE(previous);
-          } else {
-            int lse_idx = q * params.stride_lse_q +
-                          head_q * params.stride_lse_h +
-                          idx_b * params.stride_lse_b;
-            ElementA old_lse = params.lse[lse_idx];
-            ElementA partial_lse = tOrLSE(i);
-            ElementA merged_max = sycl::max(old_lse, partial_lse);
-            ElementA old_weight =
-                sycl::exp(old_lse - merged_max);
-            ElementA partial_weight =
-                sycl::exp(partial_lse - merged_max);
-            ElementA inv_sum =
-                ElementA(1) / (old_weight + partial_weight);
+          int owner_lane =
+              q_in_sg % cute::intel::sg_size;
+          int owner_value =
+              q_in_sg / cute::intel::sg_size;
 
-            tOrAlpha(i) = old_weight * inv_sum;
-            tOrLSE(i) = merged_max - sycl::log(inv_sum);
-          }
-        }
-
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tOrO.size(); i++) {
-          auto coord = tOgO(i);
-          int q = get<0>(coord);
-          if (q >= size<0>(O)) {
-            continue;
-          }
-
-          ElementA alpha = tOrAlpha(i);
+          ElementA alpha = sycl::group_broadcast(
+              sg, rA_alpha(owner_value), owner_lane);
           ElementA beta = ElementA(1) - alpha;
           tOrO(i) =
               alpha * tOrOldO(i) + beta * tOrO(i);
@@ -310,18 +337,23 @@ public:
       // Store the normalized or accumulated output fragment.
       copy(copy_o, tOrO, tOgO);
 
-      // One output element per query row owns the row-wise LSE store.
+      // Store LSE directly from its compact row fragment. The subgroup TV layout
+      // assigns each logical row to exactly one physical (lane, local-value)
+      // owner, so no v == 0 selection or output-layout reorder is needed.
       if (params.lse) {
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tOrO.size(); i++) {
-          auto coord = tOgO(i);
-          int q = get<0>(coord);
-          int v = get<1>(coord);
-          if (v == 0 && q < size<0>(O)) {
+	for (int i = 0; i < rA_lse.size(); ++i) {
+	  int q_in_sg =
+              i * cute::intel::sg_size + lane_id;
+          int q_in_tile =
+              q_sg * size<0>(SGTileShapeA{}) + q_in_sg;
+          int q = get<0>(blk_qv) * size<0>(TileShapeO{}) + q_in_tile;
+
+          if (q < size<0>(O)) {
             int lse_idx = q * params.stride_lse_q +
                           head_q * params.stride_lse_h +
                           idx_b * params.stride_lse_b;
-            params.lse[lse_idx] = tOrLSE(i);
+	    params.lse[lse_idx] = rA_lse(i);
           }
         }
       }
