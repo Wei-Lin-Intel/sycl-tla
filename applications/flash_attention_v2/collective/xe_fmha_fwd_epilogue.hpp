@@ -50,10 +50,13 @@ using namespace cute;
 template <class CollectiveMainloop, // Attention mainloop
           class TileShapeO_,        // Shape of output tile, may be larger than P*V GEMM
           class TensorO_,           // 2D slice of global output tensor
-          class TiledCopyO_ = void> // Optional TiledCopy for loading O
+	  class TiledCopyO_ = void, // Optional TiledCopy for loading O
+          bool EnableLSE_ = false>
 class FMHAFwdEpilogue {
 
 public:
+  static constexpr bool EnableLSE = EnableLSE_;
+
   //
   // Type Aliases
   //
@@ -143,7 +146,11 @@ public:
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
-    return !args.accumulate || args.lse;
+    if constexpr (EnableLSE) {
+      return !args.accumulate || args.lse;
+    } else {
+      return !args.accumulate && args.lse == nullptr;
+    }
   }
 
   CUTLASS_HOST_DEVICE
@@ -172,124 +179,150 @@ public:
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    auto rA_lse = rA_sum;
-    constexpr ElementA kLn2 = ElementA(0.6931471805599453094);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++) {
-      rA_lse(i) = (rA_max(i) + sycl::log2(rA_sum(i))) * kLn2;
-      rA_sum(i) = ElementA(1) / rA_sum(i);
-    }
-
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++)
-      rA(i) *= broadcast<0>(rA_sum, rA, i);
-
-    /* Tile output */
-    Tensor cO = make_identity_tensor(O.shape());          // (q,v)
-    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);     // (q,v)
-
-    /* Prepare slices */
-    TiledCopyO copy_o{O};
-    auto thr_copy_o = copy_o.get_slice(thr_id);
-
-    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
-    auto tOgO = thr_copy_o.partition_D(gO);
-
-    auto rA_lse_broadcast = rA;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_lse_broadcast.size(); i++)
-      rA_lse_broadcast(i) = broadcast<0>(rA_lse, rA_lse_broadcast, i);
-
-    reorder(rA, tOrO);
-    auto tOrLSE = make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
-    reorder(rA_lse_broadcast, tOrLSE);
-
-    if (params.accumulate) {
-      TiledLoadO load_o{O};
-      auto thr_load_o = load_o.get_slice(thr_id);
-      auto tOgOldO = thr_load_o.partition_S(gO);
-      auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
-      copy(load_o, tOgOldO, tOrOldO);
-
-      // LSE merge weights depend on q, but not on the V coordinate.
-      // Cache alpha and merged LSE for each query row represented by this
-      // work-item, avoiding repeated global LSE loads and exp/log operations
-      // for output elements belonging to the same row.
-      auto tOrAlpha =
-          make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
+    if constexpr (!EnableLSE) {
+      // Fast path used by ordinary prefill. This specialization intentionally
+      // contains no LSE fragment, LSE broadcast/reorder, output accumulation,
+      // or LSE global-memory access.
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++) {
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
 
       CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tOrO.size(); i++) {
-        auto coord = tOgO(i);
-        int q = get<0>(coord);
-        if (q >= size<0>(O)) {
-          continue;
-        }
+      for (int i = 0; i < rA.size(); i++) {
+        rA(i) *= broadcast<0>(rA_sum, rA, i);
+      }
 
-        // Search earlier fragment entries owned by this work-item for the
-        // same query row. Reuse their row-wise alpha and merged LSE.
-        int previous = -1;
+      Tensor cO = make_identity_tensor(O.shape());
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);
+
+      TiledCopyO copy_o{O};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+      auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+      auto tOgO = thr_copy_o.partition_D(gO);
+
+      reorder(rA, tOrO);
+      copy(copy_o, tOrO, tOgO);
+    } else {
+      auto rA_lse = rA_sum;
+      constexpr ElementA kLn2 = ElementA(0.6931471805599453094);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++) {
+        rA_lse(i) = (rA_max(i) + sycl::log2(rA_sum(i))) * kLn2;
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++)
+        rA(i) *= broadcast<0>(rA_sum, rA, i);
+
+      /* Tile output */
+      Tensor cO = make_identity_tensor(O.shape());          // (q,v)
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);     // (q,v)
+
+      /* Prepare slices */
+      TiledCopyO copy_o{O};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+
+      auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+      auto tOgO = thr_copy_o.partition_D(gO);
+
+      auto rA_lse_broadcast = rA;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_lse_broadcast.size(); i++)
+        rA_lse_broadcast(i) = broadcast<0>(rA_lse, rA_lse_broadcast, i);
+
+      reorder(rA, tOrO);
+      auto tOrLSE = make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
+      reorder(rA_lse_broadcast, tOrLSE);
+
+      if (params.accumulate) {
+        TiledLoadO load_o{O};
+        auto thr_load_o = load_o.get_slice(thr_id);
+        auto tOgOldO = thr_load_o.partition_S(gO);
+        auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
+        copy(load_o, tOgOldO, tOrOldO);
+
+        // LSE merge weights depend on q, but not on the V coordinate.
+        // Cache alpha and merged LSE for each query row represented by this
+        // work-item, avoiding repeated global LSE loads and exp/log operations
+        // for output elements belonging to the same row.
+        auto tOrAlpha =
+            make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
+
         CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < i; j++) {
-          auto previous_coord = tOgO(j);
-          if (get<0>(previous_coord) == q) {
-            previous = j;
-            break;
+        for (int i = 0; i < tOrO.size(); i++) {
+          auto coord = tOgO(i);
+          int q = get<0>(coord);
+          if (q >= size<0>(O)) {
+            continue;
+          }
+
+          // Search earlier fragment entries owned by this work-item for the
+          // same query row. Reuse their row-wise alpha and merged LSE.
+          int previous = -1;
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < i; j++) {
+            auto previous_coord = tOgO(j);
+            if (get<0>(previous_coord) == q) {
+              previous = j;
+              break;
+            }
+          }
+
+          if (previous >= 0) {
+            tOrAlpha(i) = tOrAlpha(previous);
+            tOrLSE(i) = tOrLSE(previous);
+          } else {
+            int lse_idx = q * params.stride_lse_q +
+                          head_q * params.stride_lse_h +
+                          idx_b * params.stride_lse_b;
+            ElementA old_lse = params.lse[lse_idx];
+            ElementA partial_lse = tOrLSE(i);
+            ElementA merged_max = sycl::max(old_lse, partial_lse);
+            ElementA old_weight =
+                sycl::exp(old_lse - merged_max);
+            ElementA partial_weight =
+                sycl::exp(partial_lse - merged_max);
+            ElementA inv_sum =
+                ElementA(1) / (old_weight + partial_weight);
+
+            tOrAlpha(i) = old_weight * inv_sum;
+            tOrLSE(i) = merged_max - sycl::log(inv_sum);
           }
         }
 
-        if (previous >= 0) {
-          tOrAlpha(i) = tOrAlpha(previous);
-          tOrLSE(i) = tOrLSE(previous);
-        } else {
-          int lse_idx = q * params.stride_lse_q +
-                        head_q * params.stride_lse_h +
-                        idx_b * params.stride_lse_b;
-          ElementA old_lse = params.lse[lse_idx];
-          ElementA partial_lse = tOrLSE(i);
-          ElementA merged_max = sycl::max(old_lse, partial_lse);
-          ElementA old_weight =
-              sycl::exp(old_lse - merged_max);
-          ElementA partial_weight =
-              sycl::exp(partial_lse - merged_max);
-          ElementA inv_sum =
-              ElementA(1) / (old_weight + partial_weight);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tOrO.size(); i++) {
+          auto coord = tOgO(i);
+          int q = get<0>(coord);
+          if (q >= size<0>(O)) {
+            continue;
+          }
 
-          tOrAlpha(i) = old_weight * inv_sum;
-          tOrLSE(i) = merged_max - sycl::log(inv_sum);
+          ElementA alpha = tOrAlpha(i);
+          ElementA beta = ElementA(1) - alpha;
+          tOrO(i) =
+              alpha * tOrOldO(i) + beta * tOrO(i);
         }
       }
 
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tOrO.size(); i++) {
-        auto coord = tOgO(i);
-        int q = get<0>(coord);
-        if (q >= size<0>(O)) {
-          continue;
-        }
+      // Store the normalized or accumulated output fragment.
+      copy(copy_o, tOrO, tOgO);
 
-        ElementA alpha = tOrAlpha(i);
-        ElementA beta = ElementA(1) - alpha;
-        tOrO(i) =
-            alpha * tOrOldO(i) + beta * tOrO(i);
-      }
-    }
-
-    // Store the normalized or accumulated output fragment.
-    copy(copy_o, tOrO, tOgO);
-
-    // One output element per query row owns the row-wise LSE store.
-    if (params.lse) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tOrO.size(); i++) {
-        auto coord = tOgO(i);
-        int q = get<0>(coord);
-        int v = get<1>(coord);
-        if (v == 0 && q < size<0>(O)) {
-          int lse_idx = q * params.stride_lse_q +
-                        head_q * params.stride_lse_h +
-                        idx_b * params.stride_lse_b;
-          params.lse[lse_idx] = tOrLSE(i);
+      // One output element per query row owns the row-wise LSE store.
+      if (params.lse) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tOrO.size(); i++) {
+          auto coord = tOgO(i);
+          int q = get<0>(coord);
+          int v = get<1>(coord);
+          if (v == 0 && q < size<0>(O)) {
+            int lse_idx = q * params.stride_lse_q +
+                          head_q * params.stride_lse_h +
+                          idx_b * params.stride_lse_b;
+            params.lse[lse_idx] = tOrLSE(i);
+          }
         }
       }
     }

@@ -35,7 +35,7 @@ private:
 };
 
 template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
-          typename SubgroupLayoutQK>
+	  typename SubgroupLayoutQK, bool EnableLSE>
 int runPrefill(const Options &options) {
   constexpr int PipelineStages = 2;
   using Config =
@@ -50,7 +50,24 @@ int runPrefill(const Options &options) {
   // non-cached, non-paged prefill. Select the BSHD scheduler directly
   // instead of going through FMHAConfig::run(), which selects the default
   // individual scheduler.
-  return Config::template run<false, false, false, Scheduler>(options);
+  return Config::template run<
+      false, false, false, Scheduler, EnableLSE>(options);
+}
+
+template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
+          typename SubgroupLayoutQK>
+int runPrefillDispatch(const Options &options) {
+  if (options.external_lse) {
+    return runPrefill<Causal, ShapeQK, ShapePV, ShapeOut,
+                      SubgroupLayoutQK, true>(options);
+  }
+
+  if (options.accumulate_output) {
+    return -1;
+  }
+
+  return runPrefill<Causal, ShapeQK, ShapePV, ShapeOut,
+                    SubgroupLayoutQK, false>(options);
 }
 
 int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
@@ -136,10 +153,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _64>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                     options)
-               : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+	       ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options)
+               : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options);
   }
 
   if (headSizeVO == 96) {
@@ -148,10 +165,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _96>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                     options)
-               : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+	       ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options)
+               : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options);
   }
 
   if (headSizeVO == 128) {
@@ -160,10 +177,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _128>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                     options)
-               : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+	       ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options)
+               : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options);
   }
 
   using ShapeQK = Shape<_256, _64, _32>;
@@ -171,10 +188,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   using ShapeOut = Shape<_256, _192>;
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
   return isCausal
-             ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                   options)
-             : runPrefill<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                   options);
+	     ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                  SubgroupLayoutQK>(options)
+             : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                  SubgroupLayoutQK>(options);
 }
 
 inline bool stride_fits_int64_to_int(int64_t value) {

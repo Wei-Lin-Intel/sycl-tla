@@ -994,7 +994,8 @@ struct FMHAConfig {
                                                decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{})),
                                                SubgroupLayoutPV_>;
 
-  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler>
+  template <bool isVarLen, bool CachedKV, bool PagedKV, class Scheduler,
+            bool EnableLSE = false>
   static int run(const Options &options) {
     //
     // Run examples
@@ -1045,7 +1046,8 @@ struct FMHAConfig {
         CollectiveMainloop,
         TileShapeOutput,
         TensorO,
-        GmemTiledCopyO
+	GmemTiledCopyO,
+        EnableLSE
     >;
 
     static_assert(!(persistent & Causal), "persistent SDPA kernel not support Causal yet");
