@@ -317,8 +317,8 @@ reduce(SubgroupTensor<Engine,FragLayout,SubgroupTVLayout> const& src, BinaryOp o
 
   /* Create output tensor */
   auto rshape = replace<Mode>(shape, _1{});
-  auto out = make_subgroup_tensor(make_tensor<T>(ceil_div(size(rshape), intel::_SGSize{})),
-                                  make_identity_layout(rshape));
+  Tensor out = make_subgroup_tensor(make_tensor<T>(ceil_div(size(rshape), intel::_SGSize{})),
+                                    make_identity_layout(rshape));
 
   /* Check for reduction type */
   constexpr bool horizontal = (size<0>(rcoord_to_tv) == intel::_SGSize{} * size<0>(rcoord_to_v));
