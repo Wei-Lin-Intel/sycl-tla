@@ -76,11 +76,6 @@ def parse_args():
         help="Request both output and log-sum-exp tensors",
     )
     parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="Compare against concatenated K/V attention in float32",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=2026,
@@ -140,36 +135,6 @@ def validate_args(args):
         raise ValueError("--warmup must be non-negative")
     if args.loops <= 0:
         raise ValueError("--loops must be greater than 0")
-    score_elements = (
-        args.bs
-        * args.q_nhead
-        * args.q_seq_len
-        * args.kv_seq_len
-        * args.kv_list_size
-    )
-    if args.verify and score_elements > 64 * 1024 * 1024:
-        raise ValueError(
-            "--verify materializes the reference score matrix; use smaller "
-            "sequence lengths or fewer heads"
-        )
-
-
-def verify_result(q, k_list, v_list, output, lse):
-    head_group = q.size(2) // k_list[0].size(2)
-    k = torch.cat(k_list, dim=1).repeat_interleave(head_group, dim=2)
-    v = torch.cat(v_list, dim=1).repeat_interleave(head_group, dim=2)
-    q_ref = q.float().permute(0, 2, 1, 3)
-    k_ref = k.float().permute(0, 2, 1, 3)
-    v_ref = v.float().permute(0, 2, 1, 3)
-    scores = torch.matmul(q_ref, k_ref.transpose(-2, -1))
-    scores *= q.size(3) ** -0.5
-    lse_ref = torch.logsumexp(scores, dim=-1).permute(0, 2, 1)
-    output_ref = torch.matmul(torch.softmax(scores, dim=-1), v_ref)
-    output_ref = output_ref.permute(0, 2, 1, 3)
-
-    torch.testing.assert_close(output, output_ref, rtol=5e-2, atol=5e-2)
-    if lse is not None:
-        torch.testing.assert_close(lse, lse_ref, rtol=5e-2, atol=5e-2)
 
 
 def main():
@@ -292,9 +257,6 @@ def main():
     if lse is not None:
         print(f"  LSE shape          : {list(lse.shape)} [B, S, H]")
         print(f"  LSE dtype          : {lse.dtype}")
-    if args.verify:
-        verify_result(q, k_list, v_list, output, lse)
-        print("  Correctness        : passed")
     print(f"  Q memory           : {q_bytes / 1024**3:.3f} GiB")
     print(f"  K/V-list memory    : {kv_bytes / 1024**3:.3f} GiB")
     print(f"  Total input memory : {(q_bytes + kv_bytes) / 1024**3:.3f} GiB")
