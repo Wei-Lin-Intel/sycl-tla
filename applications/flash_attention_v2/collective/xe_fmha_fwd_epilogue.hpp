@@ -283,10 +283,6 @@ public:
       auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
       auto tOgO = thr_copy_o.partition_D(gO);
 
-      // Only the output accumulator is reordered. LSE remains in its compact
-      // row-fragment representation.
-      reorder(rA, tOrO);
-
       if (params.accumulate) {
         TiledLoadO load_o{O};
         auto thr_load_o = load_o.get_slice(thr_id);
@@ -294,46 +290,16 @@ public:
         auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
         copy(load_o, tOgOldO, tOrOldO);
 
-	// Alpha is row-wise. Broadcast the compact row fragment directly into
-        // the output-store layout instead of materializing a full alpha or LSE
-        // output fragment.
+        // TiledLoadO is a C-load generated from TiledMMAPV, so tOrOldO is in
+        // the MMA accumulator layout. Merge in that layout and perform only
+        // one accumulator-to-store reorder afterwards.
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tOrO.size(); i++) {
-          auto coord = tOgO(i);
-          int q = get<0>(coord);
-          if (q >= size<0>(O)) {
-            continue;
-          }
-
-	  // tOrO has a hierarchical TV layout, so cute::broadcast<0>() cannot
-          // index it as a simple (thread,value) layout. Derive the physical
-          // owner of this query row explicitly.
-          //
-          // rA_alpha is distributed linearly over the subgroup:
-          //
-          //   q_in_sg = local_value * SGSize + owner_lane
-          //
-          // Each lane indexes the same local-value slot, and group_broadcast
-          // selects the lane that owns the requested query row.
-          int q_tile_base =
-              get<0>(blk_qv) * size<0>(TileShapeO{});
-          int q_in_tile = q - q_tile_base;
-          int q_in_sg =
-              q_in_tile - q_sg * size<0>(SGTileShapeA{});
-
-          int owner_lane =
-              q_in_sg % cute::intel::sg_size;
-          int owner_value =
-              q_in_sg / cute::intel::sg_size;
-
-          ElementA alpha = sycl::group_broadcast(
-              sg, rA_alpha(owner_value), owner_lane);
-          ElementA beta = ElementA(1) - alpha;
-          tOrO(i) =
-              alpha * tOrOldO(i) + beta * tOrO(i);
+        for (int i = 0; i < rA.size(); ++i) {
+          ElementA alpha = broadcast<0>(rA_alpha, rA, i);
+          rA(i) += alpha * (ElementA(tOrOldO(i)) - rA(i));
         }
       }
-
+      reorder(rA, tOrO);
       // Store the normalized or accumulated output fragment.
       copy(copy_o, tOrO, tOgO);
 
