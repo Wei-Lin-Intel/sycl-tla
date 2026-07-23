@@ -201,7 +201,7 @@ public:
       rA_lse_broadcast(i) = broadcast<0>(rA_lse, rA_lse_broadcast, i);
 
     reorder(rA, tOrO);
-    auto tOrLSE = make_fragment_like(tOrO);
+    auto tOrLSE = make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
     reorder(rA_lse_broadcast, tOrLSE);
 
     if (params.accumulate) {
