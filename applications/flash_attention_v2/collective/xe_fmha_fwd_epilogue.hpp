@@ -211,10 +211,13 @@ public:
                     "row-level LSE epilogue currently requires ReduceK == 1");
 
       auto rA_lse = rA_sum;
-      constexpr ElementA kLn2 = ElementA(0.6931471805599453094);
+      // Keep LSE in the base-2 (log2) domain end-to-end. This drops the *kLn2
+      // conversion here and lets the accumulate-merge use exp2/log2 directly,
+      // which lower to fewer instructions and temporaries than native exp/log
+      // (helps register pressure). rA_lse now stores log2-domain LSE.
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
-        rA_lse(i) = (rA_max(i) + sycl::log2(rA_sum(i))) * kLn2;
+	rA_lse(i) = rA_max(i) + sycl::native::log2(rA_sum(i));   // log2-domain
         rA_sum(i) = ElementA(1) / rA_sum(i);
       }
 
@@ -234,9 +237,7 @@ public:
         return get<0>(blk_qv) * size<0>(TileShapeO{}) + q_in_tile;
       };
 
-      // Fold old-LSE merge directly into rA_lse; store the resulting alpha
-      // back into rA_sum's slot is NOT possible (still needed), so keep alpha
-      // in a single reused row fragment that dies right after the merge loop.
+      // ---- old-LSE merge: compute alpha (stashed in rA_max) and new log2-LSE.
       if (params.accumulate) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < rA_lse.size(); ++i) {
@@ -245,16 +246,17 @@ public:
             int lse_idx = q * params.stride_lse_q +
                           head_q * params.stride_lse_h +
                           idx_b * params.stride_lse_b;
+            // params.lse is stored in log2 domain (see store below).
             ElementA old_lse     = params.lse[lse_idx];
-            ElementA partial_lse = rA_lse(i);
+	    ElementA partial_lse = rA_lse(i);
             ElementA merged_max  = sycl::max(old_lse, partial_lse);
-            ElementA old_weight  = sycl::native::exp(old_lse - merged_max);
-            ElementA partial_w   = sycl::native::exp(partial_lse - merged_max);
+	    ElementA old_weight  = sycl::native::exp2(old_lse - merged_max);
+            ElementA partial_w   = sycl::native::exp2(partial_lse - merged_max);
             ElementA inv_sum     = ElementA(1) / (old_weight + partial_w);
             // Reuse rA_sum(i) as the alpha carrier: it already held 1/sum which
             // has been consumed into rA below only later, so instead we apply
             // the softmax normalization to rA BEFORE overwriting, see ordering.
-            rA_lse(i) = merged_max - sycl::native::log(inv_sum);
+	    rA_lse(i) = merged_max - sycl::native::log2(inv_sum);   // log2-domain
             // stash alpha in rA_max(i) (dead after this point).
             rA_max(i) = old_weight * inv_sum;
           } else {
@@ -279,9 +281,6 @@ public:
 
       if (params.accumulate) {
         // Load old O in the MMA accumulator layout, merge, reorder once.
-        // Keep tOrOldO's live range as SHORT as possible: load + immediate
-        // consume in the same loop, so the register allocator can release it
-        // before the store reorder.
         TiledLoadO load_o{O};
         auto thr_load_o = load_o.get_slice(thr_id);
         auto tOgOldO = thr_load_o.partition_S(gO);
@@ -290,13 +289,12 @@ public:
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < rA.size(); ++i) {
-          ElementA alpha = broadcast<0>(rA_max, rA, i);   // alpha stashed above
+          ElementA alpha = broadcast<0>(rA_max, rA, i);
           rA(i) = sycl::fma(alpha, ElementA(tOrOldO(i)),
                             (ElementA(1) - alpha) * rA(i));
         }
       }
       reorder(rA, tOrO);
-
       // Store the normalized or accumulated output fragment.
       copy(copy_o, tOrO, tOgO);
 
@@ -305,13 +303,14 @@ public:
       // owner, so no v == 0 selection or output-layout reorder is needed.
       if (params.lse) {
         CUTLASS_PRAGMA_UNROLL
-	for (int i = 0; i < rA_lse.size(); ++i) {
+        for (int i = 0; i < rA_lse.size(); ++i) {
           int q = row_q(i);
           if (q < size<0>(O)) {
             int lse_idx = q * params.stride_lse_q +
                           head_q * params.stride_lse_h +
                           idx_b * params.stride_lse_b;
-            params.lse[lse_idx] = rA_lse(i);
+            // Store in log2 domain (consistent with the merge above).
+	    params.lse[lse_idx] = rA_lse(i);
           }
         }
       }
