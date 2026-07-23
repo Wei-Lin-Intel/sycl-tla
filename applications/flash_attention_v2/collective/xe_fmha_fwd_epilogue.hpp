@@ -225,12 +225,13 @@ public:
       auto rOAlpha = rOLSE;
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       int lane = sg.get_local_linear_id();
-      int q_tile = get<0>(blk_qv) * get<0>(TileShapeO{});
+      int q_offset = get<0>(tOgO(0)) -
+                     get<0>(tOrO.tv_layout()(lane, 0));
 
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rOLSE.size(); i++) {
         auto coord = rOLSE.tv_layout()(lane, i);
-        int q = q_tile + get<0>(coord);
+        int q = q_offset + get<0>(coord);
         if (q >= size<0>(O)) {
           continue;
         }

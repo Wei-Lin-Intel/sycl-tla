@@ -72,7 +72,6 @@ struct Options {
   const void *external_v;
   void *external_o;
   float *external_lse;
-  bool accumulate_output;
   bool use_external_strides;
   int stride_q_s, stride_q_h, stride_q_b;
   int stride_k_s, stride_k_h, stride_k_b;
@@ -84,7 +83,7 @@ struct Options {
       : help(false), error(false), is_causal(false), print_performance(true), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
         seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual"),
         external_q(nullptr), external_k(nullptr), external_v(nullptr), external_o(nullptr),
-        external_lse(nullptr), accumulate_output(false), use_external_strides(false),
+        external_lse(nullptr), use_external_strides(false),
         stride_q_s(0), stride_q_h(0), stride_q_b(0), stride_k_s(0), stride_k_h(0), stride_k_b(0),
         stride_v_s(0), stride_v_h(0), stride_v_b(0), stride_o_s(0), stride_o_h(0), stride_o_b(0),
         stride_lse_q(0), stride_lse_h(0), stride_lse_b(0) {}
