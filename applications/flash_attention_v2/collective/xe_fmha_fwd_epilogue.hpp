@@ -274,6 +274,25 @@ public:
             alpha * tOrOldO(i) + beta * tOrO(i);
       }
     }
+
+    // Store the normalized or accumulated output fragment.
+    copy(copy_o, tOrO, tOgO);
+
+    // One output element per query row owns the row-wise LSE store.
+    if (params.lse) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < tOrO.size(); i++) {
+        auto coord = tOgO(i);
+        int q = get<0>(coord);
+        int v = get<1>(coord);
+        if (v == 0 && q < size<0>(O)) {
+          int lse_idx = q * params.stride_lse_q +
+                        head_q * params.stride_lse_h +
+                        idx_b * params.stride_lse_b;
+          params.lse[lse_idx] = tOrLSE(i);
+        }
+      }
+    }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.
