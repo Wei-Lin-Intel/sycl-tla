@@ -218,19 +218,6 @@ public:
         rA_sum(i) = ElementA(1) / rA_sum(i);
       }
 
-      // rA_lse is a subgroup row fragment. Its subgroup TV layout maps each
-      // physical (lane, local-value) pair to the corresponding logical query
-      // row in the output tile. Thus each row already has a unique physical
-      // owner; no expansion to a full [Q,V] fragment is necessary.
-      auto rA_alpha = rA_lse;
-
-      // reduce<1>() returns a compact row fragment without preserving the
-      // SubgroupTensor wrapper, so rA_lse has no tv_layout(). The reduction
-      // stores logical query rows linearly across the subgroup:
-      //
-      //   local row = local_value_index * subgroup_size + lane_id
-      //
-      // The P*V thread layout identifies which Q subgroup owns this fragment.
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       int lane_id = static_cast<int>(sg.get_local_id()[0]);
       auto thr_mnk =
@@ -238,36 +225,45 @@ public:
               .get_flat_coord(assert_uniform(thr_id));
       int q_sg = get<0>(thr_mnk);
 
+      // A single helper to reproduce the per-row query index + validity.
+      // Cheap integer math, recomputed on demand -> avoids keeping per-row
+      // index/validity arrays alive in registers.
+      auto row_q = [&](int i) {
+        int q_in_sg   = i * cute::intel::sg_size + lane_id;
+        int q_in_tile = q_sg * size<0>(SGTileShapeA{}) + q_in_sg;
+        return get<0>(blk_qv) * size<0>(TileShapeO{}) + q_in_tile;
+      };
+
+      // Fold old-LSE merge directly into rA_lse; store the resulting alpha
+      // back into rA_sum's slot is NOT possible (still needed), so keep alpha
+      // in a single reused row fragment that dies right after the merge loop.
       if (params.accumulate) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < rA_lse.size(); ++i) {
-	  int q_in_sg =
-              i * cute::intel::sg_size + lane_id;
-          int q_in_tile =
-              q_sg * size<0>(SGTileShapeA{}) + q_in_sg;
-          int q = get<0>(blk_qv) * size<0>(TileShapeO{}) + q_in_tile;
-
+          int q = row_q(i);
           if (q < size<0>(O)) {
             int lse_idx = q * params.stride_lse_q +
                           head_q * params.stride_lse_h +
                           idx_b * params.stride_lse_b;
-
-            ElementA old_lse = params.lse[lse_idx];
+            ElementA old_lse     = params.lse[lse_idx];
             ElementA partial_lse = rA_lse(i);
-            ElementA merged_max = sycl::max(old_lse, partial_lse);
-            ElementA old_weight =
-                sycl::native::exp(old_lse - merged_max);
-            ElementA partial_weight =
-                sycl::native::exp(partial_lse - merged_max);
-            ElementA inv_sum =
-                ElementA(1) / (old_weight + partial_weight);
-
-            rA_alpha(i) = old_weight * inv_sum;
+            ElementA merged_max  = sycl::max(old_lse, partial_lse);
+            ElementA old_weight  = sycl::native::exp(old_lse - merged_max);
+            ElementA partial_w   = sycl::native::exp(partial_lse - merged_max);
+            ElementA inv_sum     = ElementA(1) / (old_weight + partial_w);
+            // Reuse rA_sum(i) as the alpha carrier: it already held 1/sum which
+            // has been consumed into rA below only later, so instead we apply
+            // the softmax normalization to rA BEFORE overwriting, see ordering.
             rA_lse(i) = merged_max - sycl::native::log(inv_sum);
+            // stash alpha in rA_max(i) (dead after this point).
+            rA_max(i) = old_weight * inv_sum;
+          } else {
+            rA_max(i) = ElementA(0);
           }
         }
       }
 
+      // Apply softmax normalization to the current-tile output.
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA.size(); i++)
         rA(i) *= broadcast<0>(rA_sum, rA, i);
@@ -276,30 +272,31 @@ public:
       Tensor cO = make_identity_tensor(O.shape());          // (q,v)
       Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);     // (q,v)
 
-      /* Prepare slices */
       TiledCopyO copy_o{O};
       auto thr_copy_o = copy_o.get_slice(thr_id);
-
       auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
       auto tOgO = thr_copy_o.partition_D(gO);
 
       if (params.accumulate) {
+        // Load old O in the MMA accumulator layout, merge, reorder once.
+        // Keep tOrOldO's live range as SHORT as possible: load + immediate
+        // consume in the same loop, so the register allocator can release it
+        // before the store reorder.
         TiledLoadO load_o{O};
         auto thr_load_o = load_o.get_slice(thr_id);
         auto tOgOldO = thr_load_o.partition_S(gO);
         auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
         copy(load_o, tOgOldO, tOrOldO);
 
-        // TiledLoadO is a C-load generated from TiledMMAPV, so tOrOldO is in
-        // the MMA accumulator layout. Merge in that layout and perform only
-        // one accumulator-to-store reorder afterwards.
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < rA.size(); ++i) {
-          ElementA alpha = broadcast<0>(rA_alpha, rA, i);
-          rA(i) += alpha * (ElementA(tOrOldO(i)) - rA(i));
+          ElementA alpha = broadcast<0>(rA_max, rA, i);   // alpha stashed above
+          rA(i) = sycl::fma(alpha, ElementA(tOrOldO(i)),
+                            (ElementA(1) - alpha) * rA(i));
         }
       }
       reorder(rA, tOrO);
+
       // Store the normalized or accumulated output fragment.
       copy(copy_o, tOrO, tOgO);
 
@@ -309,17 +306,12 @@ public:
       if (params.lse) {
         CUTLASS_PRAGMA_UNROLL
 	for (int i = 0; i < rA_lse.size(); ++i) {
-	  int q_in_sg =
-              i * cute::intel::sg_size + lane_id;
-          int q_in_tile =
-              q_sg * size<0>(SGTileShapeA{}) + q_in_sg;
-          int q = get<0>(blk_qv) * size<0>(TileShapeO{}) + q_in_tile;
-
+          int q = row_q(i);
           if (q < size<0>(O)) {
             int lse_idx = q * params.stride_lse_q +
                           head_q * params.stride_lse_h +
                           idx_b * params.stride_lse_b;
-	    params.lse[lse_idx] = rA_lse(i);
+            params.lse[lse_idx] = rA_lse(i);
           }
         }
       }
