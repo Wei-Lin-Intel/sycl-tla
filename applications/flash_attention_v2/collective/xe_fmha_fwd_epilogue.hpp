@@ -211,6 +211,13 @@ public:
       auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
       copy(load_o, tOgOldO, tOrOldO);
 
+      // LSE merge weights depend on q, but not on the V coordinate.
+      // Cache alpha and merged LSE for each query row represented by this
+      // work-item, avoiding repeated global LSE loads and exp/log operations
+      // for output elements belonging to the same row.
+      auto tOrAlpha =
+          make_subgroup_tensor(make_fragment_like(tOrO), tOrO.tv_layout());
+
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tOrO.size(); i++) {
         auto coord = tOgO(i);
@@ -218,36 +225,53 @@ public:
         if (q >= size<0>(O)) {
           continue;
         }
-        int lse_idx = q * params.stride_lse_q +
-                      head_q * params.stride_lse_h +
-                      idx_b * params.stride_lse_b;
-        ElementA old_lse = params.lse[lse_idx];
-        ElementA partial_lse = tOrLSE(i);
-        ElementA merged_lse = sycl::max(old_lse, partial_lse);
-        ElementA old_weight = sycl::exp(old_lse - merged_lse);
-        ElementA partial_weight = sycl::exp(partial_lse - merged_lse);
-        ElementA inv_sum = ElementA(1) / (old_weight + partial_weight);
-        tOrO(i) = (old_weight * tOrOldO(i) +
-                   partial_weight * tOrO(i)) * inv_sum;
-        tOrLSE(i) = merged_lse -
-                    sycl::log(inv_sum);
+
+        // Search earlier fragment entries owned by this work-item for the
+        // same query row. Reuse their row-wise alpha and merged LSE.
+        int previous = -1;
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < i; j++) {
+          auto previous_coord = tOgO(j);
+          if (get<0>(previous_coord) == q) {
+            previous = j;
+            break;
+          }
+        }
+
+        if (previous >= 0) {
+          tOrAlpha(i) = tOrAlpha(previous);
+          tOrLSE(i) = tOrLSE(previous);
+        } else {
+          int lse_idx = q * params.stride_lse_q +
+                        head_q * params.stride_lse_h +
+                        idx_b * params.stride_lse_b;
+          ElementA old_lse = params.lse[lse_idx];
+          ElementA partial_lse = tOrLSE(i);
+          ElementA merged_max = sycl::max(old_lse, partial_lse);
+          ElementA old_weight =
+              sycl::exp(old_lse - merged_max);
+          ElementA partial_weight =
+              sycl::exp(partial_lse - merged_max);
+          ElementA inv_sum =
+              ElementA(1) / (old_weight + partial_weight);
+
+          tOrAlpha(i) = old_weight * inv_sum;
+          tOrLSE(i) = merged_max - sycl::log(inv_sum);
+        }
       }
-    }
 
-    copy(copy_o, tOrO, tOgO);
-
-    if (params.lse) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tOrO.size(); i++) {
         auto coord = tOgO(i);
         int q = get<0>(coord);
-        int v = get<1>(coord);
-        if (v == 0 && q < size<0>(O)) {
-          int lse_idx = q * params.stride_lse_q +
-                        head_q * params.stride_lse_h +
-                        idx_b * params.stride_lse_b;
-          params.lse[lse_idx] = tOrLSE(i);
+        if (q >= size<0>(O)) {
+          continue;
         }
+
+        ElementA alpha = tOrAlpha(i);
+        ElementA beta = ElementA(1) - alpha;
+        tOrO(i) =
+            alpha * tOrOldO(i) + beta * tOrO(i);
       }
     }
   }
