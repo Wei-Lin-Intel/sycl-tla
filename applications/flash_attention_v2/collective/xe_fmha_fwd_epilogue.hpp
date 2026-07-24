@@ -238,7 +238,23 @@ public:
               .get_flat_coord(assert_uniform(thr_id));
       int q_sg = get<0>(thr_mnk);
 
+      /* Tile output */
+      Tensor cO = make_identity_tensor(O.shape());          // (q,v)
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);     // (q,v)
+
       if (params.accumulate) {
+        /* Issue a block 2D prefetch of the old O tile now so its
+           global-memory latency overlaps the LSE merge and output
+           normalization below. The prefetch is a read-only cache hint and
+           does not change the in-place update ordering: the actual old-O
+           load and the store still happen later. */
+        {
+          TiledLoadO load_o{O};
+          auto prefetch_o = make_block_2d_prefetch(load_o);
+          auto pOgOldO = prefetch_o.get_slice(thr_id).partition_S(gO);
+          prefetch(prefetch_o, pOgOldO);
+        }
+
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < rA_lse.size(); ++i) {
 	  int q_in_sg =
@@ -271,10 +287,6 @@ public:
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA.size(); i++)
         rA(i) *= broadcast<0>(rA_sum, rA, i);
-
-      /* Tile output */
-      Tensor cO = make_identity_tensor(O.shape());          // (q,v)
-      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);     // (q,v)
 
       /* Prepare slices */
       TiledCopyO copy_o{O};
