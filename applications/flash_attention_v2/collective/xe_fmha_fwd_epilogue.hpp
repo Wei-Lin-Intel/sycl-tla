@@ -308,8 +308,8 @@ public:
       // owner, so no v == 0 selection or output-layout reorder is needed.
       if (params.lse) {
         CUTLASS_PRAGMA_UNROLL
-	for (int i = 0; i < rA_lse.size(); ++i) {
-	  int q_in_sg =
+		for (int i = 0; i < rA_lse.size(); ++i) {
+		  int q_in_sg =
               i * cute::intel::sg_size + lane_id;
           int q_in_tile =
               q_sg * size<0>(SGTileShapeA{}) + q_in_sg;
