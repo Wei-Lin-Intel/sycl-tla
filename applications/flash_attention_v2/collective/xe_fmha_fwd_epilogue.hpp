@@ -217,7 +217,7 @@ public:
       // (helps register pressure). rA_lse now stores log2-domain LSE.
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
-	rA_lse(i) = rA_max(i) + sycl::native::log2(rA_sum(i));   // log2-domain
+        rA_lse(i) = rA_max(i) + sycl::native::log2(rA_sum(i));   // log2-domain
         rA_sum(i) = ElementA(1) / rA_sum(i);
       }
 
@@ -248,15 +248,15 @@ public:
                           idx_b * params.stride_lse_b;
             // params.lse is stored in log2 domain (see store below).
             ElementA old_lse     = params.lse[lse_idx];
-	    ElementA partial_lse = rA_lse(i);
+            ElementA partial_lse = rA_lse(i);
             ElementA merged_max  = sycl::max(old_lse, partial_lse);
-	    ElementA old_weight  = sycl::native::exp2(old_lse - merged_max);
+            ElementA old_weight  = sycl::native::exp2(old_lse - merged_max);
             ElementA partial_w   = sycl::native::exp2(partial_lse - merged_max);
             ElementA inv_sum     = ElementA(1) / (old_weight + partial_w);
             // Reuse rA_sum(i) as the alpha carrier: it already held 1/sum which
             // has been consumed into rA below only later, so instead we apply
             // the softmax normalization to rA BEFORE overwriting, see ordering.
-	    rA_lse(i) = merged_max - sycl::native::log2(inv_sum);   // log2-domain
+            rA_lse(i) = merged_max - sycl::native::log2(inv_sum);   // log2-domain
             // stash alpha in rA_max(i) (dead after this point).
             rA_max(i) = old_weight * inv_sum;
           } else {
@@ -310,7 +310,7 @@ public:
                           head_q * params.stride_lse_h +
                           idx_b * params.stride_lse_b;
             // Store in log2 domain (consistent with the merge above).
-	    params.lse[lse_idx] = rA_lse(i);
+            params.lse[lse_idx] = rA_lse(i);
           }
         }
       }
