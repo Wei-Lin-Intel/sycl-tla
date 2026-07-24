@@ -487,9 +487,20 @@ py::object prefillBf16TensorBSHDKVList(
       auto out = torch::empty(
             {q.size(0), q.size(1), q.size(2), headSizeVO},
             q.options().dtype(at::kFloat));
-      auto lse = torch::empty(
-            {q.size(0), q.size(1), q.size(2)},
-            q.options().dtype(at::kFloat));
+
+      // When there is a single K/V chunk AND the caller does not request LSE,
+      // the computation is mathematically identical to a plain prefill: there
+      // is no cross-chunk accumulation (i == 0 only) and no LSE needs to be
+      // returned. In that case we skip the LSE tensor entirely so the kernel
+      // dispatch selects the faster non-LSE epilogue path (~3.5% higher
+      // TFLOPs on B70), instead of paying for LSE compute + global stores.
+      const bool needLSE = returnLSE || (kList.size() > 1);
+      at::Tensor lse;
+      if (needLSE) {
+            lse = torch::empty(
+                  {q.size(0), q.size(1), q.size(2)},
+                  q.options().dtype(at::kFloat));
+      }
 
       TORCH_CHECK(q.device().has_index(),
                   "q must have a concrete XPU device index");
@@ -504,8 +515,10 @@ py::object prefillBf16TensorBSHDKVList(
             qView.stride(2), qView.stride(1), qView.stride(0)};
       std::array<int64_t, 3> oStrides{
             outView.stride(2), outView.stride(1), outView.stride(0)};
-      std::array<int64_t, 3> lseStrides{
-            lse.stride(1), lse.stride(2), lse.stride(0)};
+      std::array<int64_t, 3> lseStrides{};
+      if (needLSE) {
+            lseStrides = {lse.stride(1), lse.stride(2), lse.stride(0)};
+      }
 
       for (std::size_t i = 0; i < kList.size(); ++i) {
             auto kView = kList[i].permute({0, 2, 1, 3});
@@ -524,8 +537,9 @@ py::object prefillBf16TensorBSHDKVList(
                   static_cast<int>(headSizeVO), false, 1, 0, 0,
                   qView.data_ptr(), kView.data_ptr(), vView.data_ptr(),
                   outView.data_ptr<float>(), qStrides.data(), kStrides.data(),
-                  vStrides.data(), oStrides.data(), lse.data_ptr<float>(),
-                  i != 0, lseStrides.data());
+		  vStrides.data(), oStrides.data(),
+                  needLSE ? lse.data_ptr<float>() : nullptr,
+                  i != 0, needLSE ? lseStrides.data() : nullptr);
             TORCH_CHECK(ret == 0,
                         "prefill_bf16_bshd_kv_list failed in kernel run");
       }
