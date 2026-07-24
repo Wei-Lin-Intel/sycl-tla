@@ -38,10 +38,14 @@ template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
 	  typename SubgroupLayoutQK, bool EnableLSE>
 int runPrefill(const Options &options) {
   constexpr int PipelineStages = 2;
+  // The attention output tensor is always consumed as BF16 in practice.
+  // Instantiating the kernel with ElementO = bfloat16_t halves O global
+  // traffic: the non-LSE store path writes BF16, and the LSE accumulate
+  // path reads back BF16 old-O (promoted to FP32 only inside the merge).
   using Config =
       FMHAConfig<Causal, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
-                 void, PipelineStages, false,
-                 bfloat16_t, bfloat16_t, bfloat16_t>;
+		 void, PipelineStages, false,
+                 bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t>;
 
   using Scheduler =
       cutlass::fmha::kernel::XeFHMAIndividualTileScheduler;
@@ -294,17 +298,17 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
       if (useBshdOutput) {
             out = torch::empty(
                   {q.size(0), q.size(2), q.size(1), v.size(3)},
-                  q.options().dtype(at::kFloat)).permute({0, 2, 1, 3});
+                  q.options().dtype(at::kBFloat16)).permute({0, 2, 1, 3});
       } else {
             out = torch::empty(
                   {q.size(0), q.size(1), q.size(2), v.size(3)},
-                  q.options().dtype(at::kFloat));
+                  q.options().dtype(at::kBFloat16));
       }
 
       TORCH_CHECK(out.device() == q.device(),
                                   "out must be on the same XPU device as q");
-      TORCH_CHECK(out.scalar_type() == at::kFloat,
-                                  "out must have float32 dtype");
+      TORCH_CHECK(out.scalar_type() == at::kBFloat16,
+                                  "out must have bfloat16 dtype");
       TORCH_CHECK(out.dim() == 4, "out must be a rank-4 tensor");
       TORCH_CHECK(q.device().has_index(), "q must have a concrete XPU device index");
       const auto tensor_device_index = q.device().index();
@@ -369,7 +373,7 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
             static_cast<int>(seqLenKV), static_cast<int>(headSizeQK),
             static_cast<int>(headSizeVO), isCausal, iterations, warmup, verify,
             qTensor.data_ptr(), kTensor.data_ptr(), vTensor.data_ptr(),
-            out.data_ptr<float>(),
+            out.data_ptr(),
             useDirectStrides ? qStrides.data() : nullptr,
             useDirectStrides ? kStrides.data() : nullptr,
             useDirectStrides ? vStrides.data() : nullptr,
@@ -484,9 +488,11 @@ py::object prefillBf16TensorBSHDKVList(
                         "tensor dimensions must fit in int32");
       }
 
+      // O is produced and consumed as BF16. LSE stays FP32 for numerical
+      // stability of the cross-chunk log-sum-exp merge.
       auto out = torch::empty(
             {q.size(0), q.size(1), q.size(2), headSizeVO},
-            q.options().dtype(at::kFloat));
+            q.options().dtype(at::kBFloat16));
 
       // When there is a single K/V chunk AND the caller does not request LSE,
       // the computation is mathematically identical to a plain prefill: there
@@ -536,7 +542,7 @@ py::object prefillBf16TensorBSHDKVList(
                   static_cast<int>(q.size(3)),
                   static_cast<int>(headSizeVO), false, 1, 0, 0,
                   qView.data_ptr(), kView.data_ptr(), vView.data_ptr(),
-                  outView.data_ptr<float>(), qStrides.data(), kStrides.data(),
+                  outView.data_ptr(), qStrides.data(), kStrides.data(),
 		  vStrides.data(), oStrides.data(),
                   needLSE ? lse.data_ptr<float>() : nullptr,
                   i != 0, needLSE ? lseStrides.data() : nullptr);

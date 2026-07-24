@@ -281,6 +281,11 @@ public:
 
       if (params.accumulate) {
         // Load old O in the MMA accumulator layout, merge, reorder once.
+	// O lives in global memory as ElementO (BF16). We load it in its
+        // native BF16 fragment, promote each element to ElementA (FP32) for
+        // the LSE-weighted merge, and let the subsequent copy() downconvert
+        // the FP32 accumulator back to BF16 on store. This halves the O
+        // read-back bandwidth versus an FP32 O tensor.
         TiledLoadO load_o{O};
         auto thr_load_o = load_o.get_slice(thr_id);
         auto tOgOldO = thr_load_o.partition_S(gO);
@@ -290,7 +295,10 @@ public:
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < rA.size(); ++i) {
           ElementA alpha = broadcast<0>(rA_max, rA, i);
-          rA(i) = sycl::fma(alpha, ElementA(tOrOldO(i)),
+	  // Promote the BF16 old-O value to FP32 before merging so the
+          // accumulation math stays in full precision; rA remains FP32.
+          ElementA old_o = static_cast<ElementA>(tOrOldO(i));
+          rA(i) = sycl::fma(alpha, old_o,
                             (ElementA(1) - alpha) * rA(i));
         }
       }
