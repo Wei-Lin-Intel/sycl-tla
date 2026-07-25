@@ -316,7 +316,7 @@ public:
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       epilogue(O(_,_,head_q,l_coord),
                tArA, tA_max, tA_sum,
-               blk_qv, thr_id);
+               blk_qv, thr_id, head_q, idx_b);
     }
   }
 };
@@ -740,7 +740,7 @@ public:
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
         epilogue(O(_,_,head_q,idx_b),
                 tArA, tA_max, tA_sum,
-                blk_qv, thr_id);
+                blk_qv, thr_id, head_q, idx_b);
       }
     }
   }

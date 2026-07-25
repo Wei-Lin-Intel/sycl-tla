@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <pybind11/stl.h>
 
 #include "xe_fmha_fwd_runner.hpp"
 
@@ -6,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -33,13 +35,17 @@ private:
 };
 
 template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
-          typename SubgroupLayoutQK>
+	  typename SubgroupLayoutQK, bool EnableLSE>
 int runPrefill(const Options &options) {
   constexpr int PipelineStages = 2;
+  // The attention output tensor is always consumed as BF16 in practice.
+  // Instantiating the kernel with ElementO = bfloat16_t halves O global
+  // traffic: the non-LSE store path writes BF16, and the LSE accumulate
+  // path reads back BF16 old-O (promoted to FP32 only inside the merge).
   using Config =
       FMHAConfig<Causal, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK,
-                 void, PipelineStages, false,
-                 bfloat16_t, bfloat16_t, bfloat16_t>;
+		 void, PipelineStages, false,
+                 bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t>;
 
   using Scheduler =
       cutlass::fmha::kernel::XeFHMAIndividualTileScheduler;
@@ -48,7 +54,24 @@ int runPrefill(const Options &options) {
   // non-cached, non-paged prefill. Select the BSHD scheduler directly
   // instead of going through FMHAConfig::run(), which selects the default
   // individual scheduler.
-  return Config::template run<false, false, false, Scheduler>(options);
+  return Config::template run<
+      false, false, false, Scheduler, EnableLSE>(options);
+}
+
+template <bool Causal, typename ShapeQK, typename ShapePV, typename ShapeOut,
+          typename SubgroupLayoutQK>
+int runPrefillDispatch(const Options &options) {
+  if (options.external_lse) {
+    return runPrefill<Causal, ShapeQK, ShapePV, ShapeOut,
+                      SubgroupLayoutQK, true>(options);
+  }
+
+  if (options.accumulate_output) {
+    return -1;
+  }
+
+  return runPrefill<Causal, ShapeQK, ShapePV, ShapeOut,
+                    SubgroupLayoutQK, false>(options);
 }
 
 int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
@@ -61,7 +84,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     const int64_t *qStrides = nullptr,
                     const int64_t *kStrides = nullptr,
                     const int64_t *vStrides = nullptr,
-                    const int64_t *oStrides = nullptr) {
+                    const int64_t *oStrides = nullptr,
+                    float *externalLSE = nullptr,
+                    bool accumulateOutput = false,
+                    const int64_t *lseStrides = nullptr) {
   if (headSizeVO != 64 && headSizeVO != 96 && headSizeVO != 128 &&
       headSizeVO != 192) {
     return -1;
@@ -100,6 +126,14 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   options.external_k = externalK;
   options.external_v = externalV;
   options.external_o = externalO;
+  options.external_lse = externalLSE;
+  options.accumulate_output = accumulateOutput;
+
+  if (externalLSE && lseStrides) {
+    options.stride_lse_q = static_cast<int>(lseStrides[0]);
+    options.stride_lse_h = static_cast<int>(lseStrides[1]);
+    options.stride_lse_b = static_cast<int>(lseStrides[2]);
+  }
 
       if (qStrides && kStrides && vStrides && oStrides) {
             options.use_external_strides = true;
@@ -123,10 +157,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _64>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                     options)
-               : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+	       ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options)
+               : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options);
   }
 
   if (headSizeVO == 96) {
@@ -135,10 +169,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _96>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                     options)
-               : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+	       ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options)
+               : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options);
   }
 
   if (headSizeVO == 128) {
@@ -147,10 +181,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
     using ShapeOut = Shape<_256, _128>;
     using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
     return isCausal
-               ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                     options)
-               : runPrefill<false, ShapeQK, ShapePV, ShapeOut,
-                            SubgroupLayoutQK>(options);
+	       ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options)
+               : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                    SubgroupLayoutQK>(options);
   }
 
   using ShapeQK = Shape<_256, _64, _32>;
@@ -158,10 +192,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   using ShapeOut = Shape<_256, _192>;
   using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
   return isCausal
-             ? runPrefill<true, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                   options)
-             : runPrefill<false, ShapeQK, ShapePV, ShapeOut, SubgroupLayoutQK>(
-                   options);
+	     ? runPrefillDispatch<true, ShapeQK, ShapePV, ShapeOut,
+                                  SubgroupLayoutQK>(options)
+             : runPrefillDispatch<false, ShapeQK, ShapePV, ShapeOut,
+                                  SubgroupLayoutQK>(options);
 }
 
 inline bool stride_fits_int64_to_int(int64_t value) {
@@ -264,17 +298,17 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
       if (useBshdOutput) {
             out = torch::empty(
                   {q.size(0), q.size(2), q.size(1), v.size(3)},
-                  q.options().dtype(at::kFloat)).permute({0, 2, 1, 3});
+                  q.options().dtype(at::kBFloat16)).permute({0, 2, 1, 3});
       } else {
             out = torch::empty(
                   {q.size(0), q.size(1), q.size(2), v.size(3)},
-                  q.options().dtype(at::kFloat));
+                  q.options().dtype(at::kBFloat16));
       }
 
       TORCH_CHECK(out.device() == q.device(),
                                   "out must be on the same XPU device as q");
-      TORCH_CHECK(out.scalar_type() == at::kFloat,
-                                  "out must have float32 dtype");
+      TORCH_CHECK(out.scalar_type() == at::kBFloat16,
+                                  "out must have bfloat16 dtype");
       TORCH_CHECK(out.dim() == 4, "out must be a rank-4 tensor");
       TORCH_CHECK(q.device().has_index(), "q must have a concrete XPU device index");
       const auto tensor_device_index = q.device().index();
@@ -339,7 +373,7 @@ at::Tensor prefillBf16Tensor(const at::Tensor &q, const at::Tensor &k,
             static_cast<int>(seqLenKV), static_cast<int>(headSizeQK),
             static_cast<int>(headSizeVO), isCausal, iterations, warmup, verify,
             qTensor.data_ptr(), kTensor.data_ptr(), vTensor.data_ptr(),
-            out.data_ptr<float>(),
+            out.data_ptr(),
             useDirectStrides ? qStrides.data() : nullptr,
             useDirectStrides ? kStrides.data() : nullptr,
             useDirectStrides ? vStrides.data() : nullptr,
@@ -385,6 +419,143 @@ at::Tensor prefillBf16TensorBSHD(
       return outBshd;
 }
 
+py::object prefillBf16TensorBSHDKVList(
+      const at::Tensor &q, const std::vector<at::Tensor> &kList,
+      const std::vector<at::Tensor> &vList, bool isCausal = false,
+      bool returnLSE = false) {
+      TORCH_CHECK(!isCausal,
+                  "prefill_bf16_bshd_kv_list currently supports only "
+                  "non-causal attention");
+      TORCH_CHECK(q.device().type() == c10::DeviceType::XPU,
+                  "q must be an XPU tensor");
+      TORCH_CHECK(q.scalar_type() == at::kBFloat16,
+                  "q must have bfloat16 dtype");
+      TORCH_CHECK(q.dim() == 4, "q must be a rank-4 BSHD tensor");
+      TORCH_CHECK(q.is_contiguous(),
+                  "q must be contiguous in [B,S,H,D] layout");
+      TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && q.size(2) > 0 &&
+                        q.size(3) > 0,
+                  "q dimensions must be non-zero");
+      TORCH_CHECK(!kList.empty(), "k_list and v_list must be non-empty");
+      TORCH_CHECK(kList.size() == vList.size(),
+                  "k_list and v_list must have equal lengths");
+
+      auto checkInput = [&](const at::Tensor &tensor, const char *name) {
+            TORCH_CHECK(tensor.device() == q.device(), name,
+                        " tensors must be on the same XPU device as q");
+            TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name,
+                        " tensors must have bfloat16 dtype");
+            TORCH_CHECK(tensor.dim() == 4, name,
+                        " tensors must be rank-4 BSHD tensors");
+            TORCH_CHECK(tensor.is_contiguous(), name,
+                        " tensors must be contiguous in [B,S,H,D] layout");
+            TORCH_CHECK(tensor.size(0) > 0 && tensor.size(1) > 0 &&
+                              tensor.size(2) > 0 && tensor.size(3) > 0,
+                        name, " tensor dimensions must be non-zero");
+      };
+
+      const auto &firstK = kList.front();
+      const auto &firstV = vList.front();
+      for (std::size_t i = 0; i < kList.size(); ++i) {
+            checkInput(kList[i], "k_list");
+            checkInput(vList[i], "v_list");
+            TORCH_CHECK(kList[i].sizes() == firstK.sizes(),
+                        "all k_list tensors must have the same shape");
+            TORCH_CHECK(vList[i].sizes() == firstV.sizes(),
+                        "all v_list tensors must have the same shape");
+      }
+
+      TORCH_CHECK(firstK.size(0) == q.size(0) &&
+                        firstV.size(0) == q.size(0),
+                  "k/v batch dimension must match q");
+      TORCH_CHECK(firstK.size(1) == firstV.size(1) &&
+                        firstK.size(2) == firstV.size(2),
+                  "v must match k in seq_len_kv and num_heads_kv");
+      TORCH_CHECK(firstK.size(3) == q.size(3),
+                  "k last dimension must equal q last dimension");
+      TORCH_CHECK(q.size(3) % 32 == 0,
+                  "q/k head dimension must be a positive multiple of 32");
+      TORCH_CHECK(q.size(2) % firstK.size(2) == 0,
+                  "num_heads_q must be divisible by num_heads_kv");
+
+      const int64_t headSizeVO = firstV.size(3);
+      TORCH_CHECK(headSizeVO == 64 || headSizeVO == 96 ||
+                        headSizeVO == 128 || headSizeVO == 192,
+                  "v head dimension must be one of 64, 96, 128, or 192");
+      for (auto dim : {q.size(0), q.size(1), q.size(2), q.size(3),
+                       firstK.size(1), firstK.size(2), headSizeVO}) {
+            TORCH_CHECK(dim <= std::numeric_limits<int>::max(),
+                        "tensor dimensions must fit in int32");
+      }
+
+      // O is produced and consumed as BF16. LSE stays FP32 for numerical
+      // stability of the cross-chunk log-sum-exp merge.
+      auto out = torch::empty(
+            {q.size(0), q.size(1), q.size(2), headSizeVO},
+            q.options().dtype(at::kBFloat16));
+
+      // When there is a single K/V chunk AND the caller does not request LSE,
+      // the computation is mathematically identical to a plain prefill: there
+      // is no cross-chunk accumulation (i == 0 only) and no LSE needs to be
+      // returned. In that case we skip the LSE tensor entirely so the kernel
+      // dispatch selects the faster non-LSE epilogue path (~3.5% higher
+      // TFLOPs on B70), instead of paying for LSE compute + global stores.
+      const bool needLSE = returnLSE || (kList.size() > 1);
+      at::Tensor lse;
+      if (needLSE) {
+            lse = torch::empty(
+                  {q.size(0), q.size(1), q.size(2)},
+                  q.options().dtype(at::kFloat));
+      }
+
+      TORCH_CHECK(q.device().has_index(),
+                  "q must have a concrete XPU device index");
+      const auto deviceIndex = q.device().index();
+      TORCH_CHECK(deviceIndex >= 0,
+                  "q must have a non-negative XPU device index");
+      CompatDeviceGuard deviceGuard(static_cast<unsigned int>(deviceIndex));
+
+      auto qView = q.permute({0, 2, 1, 3});
+      auto outView = out.permute({0, 2, 1, 3});
+      std::array<int64_t, 3> qStrides{
+            qView.stride(2), qView.stride(1), qView.stride(0)};
+      std::array<int64_t, 3> oStrides{
+            outView.stride(2), outView.stride(1), outView.stride(0)};
+      std::array<int64_t, 3> lseStrides{};
+      if (needLSE) {
+            lseStrides = {lse.stride(1), lse.stride(2), lse.stride(0)};
+      }
+
+      for (std::size_t i = 0; i < kList.size(); ++i) {
+            auto kView = kList[i].permute({0, 2, 1, 3});
+            auto vView = vList[i].permute({0, 2, 1, 3});
+            std::array<int64_t, 3> kStrides{
+                  kView.stride(2), kView.stride(1), kView.stride(0)};
+            std::array<int64_t, 3> vStrides{
+                  vView.stride(2), vView.stride(1), vView.stride(0)};
+
+            const int ret = prefillBf16Impl(
+                  static_cast<int>(q.size(0)), static_cast<int>(q.size(2)),
+                  static_cast<int>(firstK.size(2)),
+                  static_cast<int>(q.size(1)),
+                  static_cast<int>(firstK.size(1)),
+                  static_cast<int>(q.size(3)),
+                  static_cast<int>(headSizeVO), false, 1, 0, 0,
+                  qView.data_ptr(), kView.data_ptr(), vView.data_ptr(),
+                  outView.data_ptr(), qStrides.data(), kStrides.data(),
+		  vStrides.data(), oStrides.data(),
+                  needLSE ? lse.data_ptr<float>() : nullptr,
+                  i != 0, needLSE ? lseStrides.data() : nullptr);
+            TORCH_CHECK(ret == 0,
+                        "prefill_bf16_bshd_kv_list failed in kernel run");
+      }
+
+      if (returnLSE) {
+            return py::make_tuple(out, lse);
+      }
+      return py::cast(out);
+}
+
 int prefillBf16Benchmark(int batch = 32, int numHeadsQ = 16, int numHeadsKV = 16,
                          int seqLenQO = 512, int seqLenKV = 512,
                          int headSizeQK = 128, int headSizeVO = 128,
@@ -427,4 +598,10 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("iterations") = 1,
         py::arg("warmup") = 0,
         py::arg("verify") = 0);
+  m.def("prefill_bf16_bshd_kv_list", &prefillBf16TensorBSHDKVList,
+        "Run fused non-causal BMG flash-attention over lists of contiguous "
+        "[B,S,H,D] K/V tensors",
+        py::arg("q"), py::arg("k_list"), py::arg("v_list"),
+        py::arg("is_causal") = false,
+        py::arg("return_lse") = false);
 }

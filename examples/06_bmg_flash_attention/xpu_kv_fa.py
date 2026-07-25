@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+
+import argparse
+import time
+
+import torch
+import torch.nn.functional as F
+from sycl_tla_fmha import prefill_bf16_bshd_kv_list
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Benchmark and validate sycl_tla_fmha BF16 fused attention over "
+            "a list of K/V tensors on XPU."
+        )
+    )
+    parser.add_argument("--bs", type=int, default=1, help="Batch size")
+    parser.add_argument(
+        "--q-seq-len",
+        type=int,
+        default=8192,
+        help="Query sequence length",
+    )
+    parser.add_argument(
+        "--kv-seq-len",
+        type=int,
+        default=8192,
+        help="Sequence length of each K/V tensor",
+    )
+    parser.add_argument(
+        "--kv-list-size",
+        type=int,
+        default=2,
+        help="Number of K/V tensor pairs",
+    )
+    parser.add_argument(
+        "--q-nhead",
+        type=int,
+        default=40,
+        help="Number of query attention heads",
+    )
+    parser.add_argument(
+        "--kv-nhead",
+        type=int,
+        default=40,
+        help="Number of K/V attention heads",
+    )
+    parser.add_argument(
+        "--qk-hdim",
+        type=int,
+        default=128,
+        help="Q/K head dimension; must be a multiple of 32",
+    )
+    parser.add_argument(
+        "--v-hdim",
+        type=int,
+        default=128,
+        choices=(64, 96, 128, 192),
+        help="V/output head dimension",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="Number of warmup loops",
+    )
+    parser.add_argument(
+        "--loops",
+        type=int,
+        default=10,
+        help="Number of benchmark loops",
+    )
+    parser.add_argument(
+        "--return-lse",
+        action="store_true",
+        help="Request both output and log-sum-exp tensors",
+    )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip validation against scaled_dot_product_attention",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+        help="Random seed",
+    )
+    return parser.parse_args()
+
+
+def attention_flops(
+    bs,
+    q_seq_len,
+    total_kv_seq_len,
+    q_nhead,
+    qk_hdim,
+    v_hdim,
+):
+    """
+    Attention FLOPs, excluding softmax and other elementwise operations.
+
+    Q @ K^T:
+        2 * B * Hq * Sq * Sk * Dqk
+
+    softmax(QK^T) @ V:
+        2 * B * Hq * Sq * Sk * Dvo
+
+    The K/V-list API is equivalent to attending over the concatenation of all
+    K/V chunks, so Sk is kv_list_size * kv_seq_len.
+    """
+    return (
+        2
+        * bs
+        * q_nhead
+        * q_seq_len
+        * total_kv_seq_len
+        * (qk_hdim + v_hdim)
+    )
+
+
+def validate_args(args):
+    if args.bs <= 0:
+        raise ValueError("--bs must be greater than 0")
+    if args.q_seq_len <= 0:
+        raise ValueError("--q-seq-len must be greater than 0")
+    if args.kv_seq_len <= 0:
+        raise ValueError("--kv-seq-len must be greater than 0")
+    if args.kv_list_size <= 0:
+        raise ValueError("--kv-list-size must be greater than 0")
+    if args.q_nhead <= 0:
+        raise ValueError("--q-nhead must be greater than 0")
+    if args.kv_nhead <= 0:
+        raise ValueError("--kv-nhead must be greater than 0")
+    if args.q_nhead % args.kv_nhead != 0:
+        raise ValueError("--q-nhead must be divisible by --kv-nhead")
+    if args.qk_hdim <= 0 or args.qk_hdim % 32 != 0:
+        raise ValueError("--qk-hdim must be a positive multiple of 32")
+    if args.warmup < 0:
+        raise ValueError("--warmup must be non-negative")
+    if args.loops <= 0:
+        raise ValueError("--loops must be greater than 0")
+
+
+def reference_attention(q, k_list, v_list):
+    """
+    Compute the reference result using PyTorch SDPA.
+
+    The K/V-list operation is equivalent to concatenating all K/V tensors
+    along the sequence dimension before running attention.
+
+    Input layout:
+        q:      [B, Sq, Hq, Dqk]
+        k_list: list of [B, Sk, Hkv, Dqk]
+        v_list: list of [B, Sk, Hkv, Dvo]
+
+    SDPA layout:
+        q: [B, Hq, Sq, Dqk]
+        k: [B, Hq, Sk_total, Dqk]
+        v: [B, Hq, Sk_total, Dvo]
+    """
+    k = torch.cat(k_list, dim=1)
+    v = torch.cat(v_list, dim=1)
+
+    q_bhsd = q.transpose(1, 2)
+    k_bhsd = k.transpose(1, 2)
+    v_bhsd = v.transpose(1, 2)
+
+    # Explicitly expand GQA K/V heads because enable_gqa support may vary
+    # between PyTorch XPU versions and SDPA backends.
+    if q_bhsd.size(1) != k_bhsd.size(1):
+        group_size = q_bhsd.size(1) // k_bhsd.size(1)
+        k_bhsd = k_bhsd.repeat_interleave(group_size, dim=1)
+        v_bhsd = v_bhsd.repeat_interleave(group_size, dim=1)
+
+    ref_bhsd = F.scaled_dot_product_attention(
+        query=q_bhsd,
+        key=k_bhsd,
+        value=v_bhsd,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+
+    return ref_bhsd.transpose(1, 2).contiguous()
+
+
+def main():
+    args = parse_args()
+    validate_args(args)
+
+    if not hasattr(torch, "xpu") or not torch.xpu.is_available():
+        raise RuntimeError("No available XPU device was detected")
+
+    torch.manual_seed(args.seed)
+
+    device = torch.device("xpu")
+    dtype = torch.bfloat16
+
+    # Native API layout: contiguous [B, S, H, D].
+    qshape = (
+        args.bs,
+        args.q_seq_len,
+        args.q_nhead,
+        args.qk_hdim,
+    )
+    kshape = (
+        args.bs,
+        args.kv_seq_len,
+        args.kv_nhead,
+        args.qk_hdim,
+    )
+    vshape = (
+        args.bs,
+        args.kv_seq_len,
+        args.kv_nhead,
+        args.v_hdim,
+    )
+
+    q = torch.randn(qshape, device=device, dtype=dtype)
+    k_list = [
+        torch.randn(kshape, device=device, dtype=dtype)
+        for _ in range(args.kv_list_size)
+    ]
+    v_list = [
+        torch.randn(vshape, device=device, dtype=dtype)
+        for _ in range(args.kv_list_size)
+    ]
+
+    def run_attention():
+        return prefill_bf16_bshd_kv_list(
+            q=q,
+            k_list=k_list,
+            v_list=v_list,
+            is_causal=False,
+            return_lse=args.return_lse,
+        )
+
+    total_kv_seq_len = args.kv_seq_len * args.kv_list_size
+    element_size = torch.tensor([], dtype=dtype).element_size()
+
+    q_bytes = (
+        args.bs
+        * args.q_seq_len
+        * args.q_nhead
+        * args.qk_hdim
+        * element_size
+    )
+    kv_bytes = (
+        args.kv_list_size
+        * args.bs
+        * args.kv_seq_len
+        * args.kv_nhead
+        * (args.qk_hdim + args.v_hdim)
+        * element_size
+    )
+
+    print("XPU BF16 fused K/V-list attention benchmark")
+    print("  Input layout       : [B, S, H, D]")
+    print(f"  Q shape            : {list(qshape)}")
+    print(f"  K tensor shape     : {list(kshape)}")
+    print(f"  V tensor shape     : {list(vshape)}")
+    print(f"  K/V list size      : {args.kv_list_size}")
+    print(f"  Total K/V length   : {total_kv_seq_len}")
+    print(f"  Data type          : {dtype}")
+    print("  Causal             : False")
+    print(f"  Return LSE         : {args.return_lse}")
+    print(f"  Verify             : {not args.skip_verify}")
+    print(f"  Warmup loops       : {args.warmup}")
+    print(f"  Benchmark loops    : {args.loops}")
+
+    result = None
+    for _ in range(args.warmup):
+        result = run_attention()
+
+    torch.xpu.synchronize()
+
+    start = time.perf_counter()
+    for _ in range(args.loops):
+        result = run_attention()
+    torch.xpu.synchronize()
+    elapsed_seconds = time.perf_counter() - start
+
+    if args.return_lse:
+        output, lse = result
+    else:
+        output = result
+        lse = None
+
+    flops_per_loop = attention_flops(
+        bs=args.bs,
+        q_seq_len=args.q_seq_len,
+        total_kv_seq_len=total_kv_seq_len,
+        q_nhead=args.q_nhead,
+        qk_hdim=args.qk_hdim,
+        v_hdim=args.v_hdim,
+    )
+
+    average_seconds = elapsed_seconds / args.loops
+    average_ms = average_seconds * 1e3
+    tflops = flops_per_loop / average_seconds / 1e12
+
+    print("\nResults")
+    print(f"  Output shape       : {list(output.shape)} [B, S, H, D]")
+    print(f"  Output dtype       : {output.dtype}")
+    if lse is not None:
+        print(f"  LSE shape          : {list(lse.shape)} [B, S, H]")
+        print(f"  LSE dtype          : {lse.dtype}")
+    print(f"  Q memory           : {q_bytes / 1024**3:.3f} GiB")
+    print(f"  K/V-list memory    : {kv_bytes / 1024**3:.3f} GiB")
+    print(f"  Total input memory : {(q_bytes + kv_bytes) / 1024**3:.3f} GiB")
+    print(f"  FLOPs per loop     : {flops_per_loop / 1e12:.6f} TFLOP")
+    print(f"  Total time         : {elapsed_seconds:.6f} s")
+    print(f"  Average latency    : {average_ms:.3f} ms")
+    print(f"  Throughput         : {tflops:.3f} TFLOPs")
+
+    if not args.skip_verify:
+        print("\nValidation")
+        print("  Reference          : F.scaled_dot_product_attention")
+
+        with torch.no_grad():
+            ref = reference_attention(q, k_list, v_list)
+
+        torch.xpu.synchronize()
+
+        # The fused kernel returns FP32 output while SDPA commonly returns
+        # BF16 for BF16 inputs. Convert both to FP32 before comparison so
+        # assert_close does not reject the dtype mismatch.
+        torch.testing.assert_close(
+            output.float(),
+            ref.float(),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+        max_abs_diff = (output.float() - ref.float()).abs().max().item()
+        print("  Status             : PASSED")
+        print("  Tolerance          : atol=5e-2, rtol=5e-2")
+        print(f"  Maximum abs diff   : {max_abs_diff:.6e}")
+
+
+if __name__ == "__main__":
+    main()

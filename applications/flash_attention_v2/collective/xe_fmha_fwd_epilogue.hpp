@@ -50,10 +50,13 @@ using namespace cute;
 template <class CollectiveMainloop, // Attention mainloop
           class TileShapeO_,        // Shape of output tile, may be larger than P*V GEMM
           class TensorO_,           // 2D slice of global output tensor
-          class TiledCopyO_ = void> // Optional TiledCopy for loading O
+	  class TiledCopyO_ = void, // Optional TiledCopy for loading O
+          bool EnableLSE_ = false>
 class FMHAFwdEpilogue {
 
 public:
+  static constexpr bool EnableLSE = EnableLSE_;
+
   //
   // Type Aliases
   //
@@ -103,9 +106,23 @@ public:
   using DefaultTiledCopyO = decltype(default_tiled_copy_O_helper());
   using TiledCopyO = conditional_t<is_void_v<TiledCopyO_>, DefaultTiledCopyO, TiledCopyO_>;
 
-  // Stateless design -- no arguments or parameters.
-  struct Arguments {};
-  struct Params {};
+  static auto default_tiled_load_O_helper() {
+    if constexpr (ReduceK{} == _1{})
+      return make_block_2d_copy_C(TiledMMAPV{}, TensorO2D{});
+    else
+      return make_block_2d_copy_C_subtiled(TiledMMAPV{}, ReduceFragA{}.tv_layout(), ReduceSGLayout{}, TensorO2D{});
+  }
+
+  using TiledLoadO = decltype(default_tiled_load_O_helper());
+
+  struct Arguments {
+    ElementA* lse = nullptr;
+    int stride_lse_q = 0;
+    int stride_lse_h = 0;
+    int stride_lse_b = 0;
+    bool accumulate = false;
+  };
+  using Params = Arguments;
 
   // Shared memory storage
   // Note sum/max tiles are padded to 16 elements, due to limitations in CuTe block load infrastructure.
@@ -125,15 +142,20 @@ private:
 public:
   static constexpr
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
-    return {};
+    return args;
   }
 
-  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
-    return true;
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    if constexpr (EnableLSE) {
+      return !args.accumulate || args.lse;
+    } else {
+      return !args.accumulate && args.lse == nullptr;
+    }
   }
 
   CUTLASS_HOST_DEVICE
-  FMHAFwdEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
+  FMHAFwdEpilogue(Params const& params_, SharedStorage& shared_)
+      : shared(shared_), params(params_) {}
 
   template <typename QVCoord>
   CUTLASS_DEVICE
@@ -143,40 +165,164 @@ public:
              FragARow       & tA_max,   // Softmax row-wise max accumulator
              FragARow       & tA_sum,   // Softmax row-wise sum accumulator
              QVCoord          blk_qv,   // WG tile indices: (q,v)
-             int              thr_id) { // Work-item ID
+             int              thr_id,   // Work-item ID
+             int              head_q,
+             int              idx_b) {
 
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_sum, rA_max, active] =
+        reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    /* Complete softmax, dividing out sums. */
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++)
-      rA_sum(i) = ElementA(1) / rA_sum(i);
+    if constexpr (!EnableLSE) {
+      // Fast path used by ordinary prefill. This specialization intentionally
+      // contains no LSE fragment, LSE broadcast/reorder, output accumulation,
+      // or LSE global-memory access.
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++) {
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
 
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA.size(); i++)
-      rA(i) *= broadcast<0>(rA_sum, rA, i);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++) {
+        rA(i) *= broadcast<0>(rA_sum, rA, i);
+      }
 
-    /* Tile output */
-    Tensor cO = make_identity_tensor(O.shape());          // (q,v)
-    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);     // (q,v)
+      Tensor cO = make_identity_tensor(O.shape());
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);
 
-    /* Prepare slices */
-    TiledCopyO copy_o{O};
-    auto thr_copy_o = copy_o.get_slice(thr_id);
+      TiledCopyO copy_o{O};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+      auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+      auto tOgO = thr_copy_o.partition_D(gO);
 
-    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
-    auto tOgO = thr_copy_o.partition_D(gO);
+      reorder(rA, tOrO);
+      copy(copy_o, tOrO, tOgO);
+    } else {
+      // The row-coordinate mapping below uses the original P*V accumulator
+      // subgroup layout directly. The Python prefill configurations currently
+      // instantiate ReduceK == 1.
+      static_assert(ReduceK{} == _1{},
+                    "row-level LSE epilogue currently requires ReduceK == 1");
 
-    /* Reorder tile and write out */
-    reorder(rA, tOrO);
-    copy(copy_o, tOrO, tOgO);
+      auto rA_lse = rA_sum;
+      // Keep LSE in the base-2 (log2) domain end-to-end. This drops the *kLn2
+      // conversion here and lets the accumulate-merge use exp2/log2 directly,
+      // which lower to fewer instructions and temporaries than native exp/log
+      // (helps register pressure). rA_lse now stores log2-domain LSE.
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++) {
+        rA_lse(i) = rA_max(i) + sycl::native::log2(rA_sum(i));   // log2-domain
+        rA_sum(i) = ElementA(1) / rA_sum(i);
+      }
+
+      auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+      int lane_id = static_cast<int>(sg.get_local_id()[0]);
+      auto thr_mnk =
+          group<1,3>(TiledMMAPV{}.get_thr_layout_vmnk())
+              .get_flat_coord(assert_uniform(thr_id));
+      int q_sg = get<0>(thr_mnk);
+
+      // A single helper to reproduce the per-row query index + validity.
+      // Cheap integer math, recomputed on demand -> avoids keeping per-row
+      // index/validity arrays alive in registers.
+      auto row_q = [&](int i) {
+        int q_in_sg   = i * cute::intel::sg_size + lane_id;
+        int q_in_tile = q_sg * size<0>(SGTileShapeA{}) + q_in_sg;
+        return get<0>(blk_qv) * size<0>(TileShapeO{}) + q_in_tile;
+      };
+
+      // ---- old-LSE merge: compute alpha (stashed in rA_max) and new log2-LSE.
+      if (params.accumulate) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA_lse.size(); ++i) {
+          int q = row_q(i);
+          if (q < size<0>(O)) {
+            int lse_idx = q * params.stride_lse_q +
+                          head_q * params.stride_lse_h +
+                          idx_b * params.stride_lse_b;
+            // params.lse is stored in log2 domain (see store below).
+            ElementA old_lse     = params.lse[lse_idx];
+            ElementA partial_lse = rA_lse(i);
+            ElementA merged_max  = sycl::max(old_lse, partial_lse);
+            ElementA old_weight  = sycl::native::exp2(old_lse - merged_max);
+            ElementA partial_w   = sycl::native::exp2(partial_lse - merged_max);
+            ElementA inv_sum     = ElementA(1) / (old_weight + partial_w);
+            // Reuse rA_sum(i) as the alpha carrier: it already held 1/sum which
+            // has been consumed into rA below only later, so instead we apply
+            // the softmax normalization to rA BEFORE overwriting, see ordering.
+            rA_lse(i) = merged_max - sycl::native::log2(inv_sum);   // log2-domain
+            // stash alpha in rA_max(i) (dead after this point).
+            rA_max(i) = old_weight * inv_sum;
+          } else {
+            rA_max(i) = ElementA(0);
+          }
+        }
+      }
+
+      // Apply softmax normalization to the current-tile output.
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++)
+        rA(i) *= broadcast<0>(rA_sum, rA, i);
+
+      /* Tile output */
+      Tensor cO = make_identity_tensor(O.shape());          // (q,v)
+      Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);     // (q,v)
+
+      TiledCopyO copy_o{O};
+      auto thr_copy_o = copy_o.get_slice(thr_id);
+      auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+      auto tOgO = thr_copy_o.partition_D(gO);
+
+      if (params.accumulate) {
+        // Load old O in the MMA accumulator layout, merge, reorder once.
+	// O lives in global memory as ElementO (BF16). We load it in its
+        // native BF16 fragment, promote each element to ElementA (FP32) for
+        // the LSE-weighted merge, and let the subsequent copy() downconvert
+        // the FP32 accumulator back to BF16 on store. This halves the O
+        // read-back bandwidth versus an FP32 O tensor.
+        TiledLoadO load_o{O};
+        auto thr_load_o = load_o.get_slice(thr_id);
+        auto tOgOldO = thr_load_o.partition_S(gO);
+        auto tOrOldO = thr_load_o.partition_sg_fragment_D(gO);
+        copy(load_o, tOgOldO, tOrOldO);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA.size(); ++i) {
+          ElementA alpha = broadcast<0>(rA_max, rA, i);
+	  // Promote the BF16 old-O value to FP32 before merging so the
+          // accumulation math stays in full precision; rA remains FP32.
+          ElementA old_o = static_cast<ElementA>(tOrOldO(i));
+          rA(i) = sycl::fma(alpha, old_o,
+                            (ElementA(1) - alpha) * rA(i));
+        }
+      }
+      reorder(rA, tOrO);
+      // Store the normalized or accumulated output fragment.
+      copy(copy_o, tOrO, tOgO);
+
+      // Store LSE directly from its compact row fragment. The subgroup TV layout
+      // assigns each logical row to exactly one physical (lane, local-value)
+      // owner, so no v == 0 selection or output-layout reorder is needed.
+      if (params.lse) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < rA_lse.size(); ++i) {
+          int q = row_q(i);
+          if (q < size<0>(O)) {
+            int lse_idx = q * params.stride_lse_q +
+                          head_q * params.stride_lse_h +
+                          idx_b * params.stride_lse_b;
+            // Store in log2 domain (consistent with the merge above).
+            params.lse[lse_idx] = rA_lse(i);
+          }
+        }
+      }
+    }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.
@@ -193,7 +339,7 @@ public:
     using namespace sycl::ext::oneapi::this_work_item;
 
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_sum, tA_max, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1,3>(TiledMMAPV{}.get_thr_layout_vmnk()).get_flat_coord(assert_uniform(thr_id));
@@ -285,9 +431,12 @@ public:
           }
         }
       }
-      return std::make_tuple(rA, rA_sum, active);
+      return std::make_tuple(rA, rA_sum, rA_max, active);
     }
   }
+
+private:
+  Params params;
 };
 
 
