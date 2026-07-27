@@ -80,6 +80,13 @@ struct Options {
   int stride_o_s, stride_o_h, stride_o_b;
   int stride_lse_q, stride_lse_h, stride_lse_b;
 
+  // ---- Ring-Attention P2P (batch == 1, non-causal) ----
+  bool ring_enabled = false;
+  void* ring_peer_k = nullptr;   // raw device ptr: next rank's K recv buffer
+  void* ring_peer_v = nullptr;   // raw device ptr: next rank's V recv buffer
+  int   ring_peer_k_ld = 0;      // row stride (elems) of peer K buffer = Hkv*Dqk
+  int   ring_peer_v_ld = 0;      // row stride (elems) of peer V buffer = Hkv*Dvo
+
   Options()
       : help(false), error(false), is_causal(false), print_performance(true), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
         seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual"),
@@ -832,7 +839,13 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
         options.softmax_scale,
         options.use_paged_kv ? paged_kv_cache.page_table.get() : nullptr,
         options.use_paged_kv ? paged_kv_cache.page_size : 0,
-        options.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr
+	options.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr,
+        // ---- ring (order must match Mainloop::Arguments) ----
+        options.ring_enabled,
+        options.ring_peer_k,
+        options.ring_peer_v,
+        options.ring_peer_k_ld,
+        options.ring_peer_v_ld
       },
       {
         options.external_lse,

@@ -103,6 +103,24 @@ if(SYCL_TLA_BUILD_PYTHON_FMHA)
   add_library(sycl_tla_fmha MODULE py_fmha_module.cpp)
   cutlass_apply_standard_compile_options(sycl_tla_fmha)
   target_compile_features(sycl_tla_fmha PRIVATE cxx_std_17)
+
+  # ---- Ring-Attention P2P deps: Intel MPI + Level-Zero loader ----
+  find_path(IMPI_INCLUDE_DIR mpi.h
+    HINTS ENV I_MPI_ROOT PATH_SUFFIXES include)
+  find_library(IMPI_LIBRARY NAMES mpi impi
+    HINTS ENV I_MPI_ROOT PATH_SUFFIXES lib lib/release)
+  find_library(ZE_LIBRARY NAMES ze_loader
+    HINTS ENV ONEAPI_ROOT ENV LD_LIBRARY_PATH PATH_SUFFIXES lib lib64)
+  if(NOT IMPI_INCLUDE_DIR OR NOT IMPI_LIBRARY)
+    message(FATAL_ERROR
+      "sycl_tla_fmha Ring-Attention requires Intel MPI. "
+      "Source oneAPI setvars.sh so I_MPI_ROOT is available.")
+  endif()
+  if(NOT ZE_LIBRARY)
+    message(FATAL_ERROR
+      "sycl_tla_fmha Ring-Attention requires the Level-Zero loader (ze_loader).")
+  endif()
+
   target_include_directories(
     sycl_tla_fmha
     PRIVATE
@@ -110,6 +128,11 @@ if(SYCL_TLA_BUILD_PYTHON_FMHA)
     ${CUTLASS_EXAMPLES_UTILS_DIR}
     ${CUTLASS_APPLICATIONS_DIR}
     ${TORCH_INCLUDE_DIRS}
+    ${IMPI_INCLUDE_DIR}
+    # comm headers are reachable as "flash_attention_v2/comm/ring_symm.hpp"
+    # via CUTLASS_APPLICATIONS_DIR above; add the folder too so bare
+    # "ring_symm.hpp" includes also resolve.
+    ${CUTLASS_APPLICATIONS_DIR}/flash_attention_v2/comm
   )
   target_link_libraries(
     sycl_tla_fmha
@@ -122,6 +145,8 @@ if(SYCL_TLA_BUILD_PYTHON_FMHA)
     ${C10_LIBRARY}
     ${C10_XPU_LIBRARY}
     ${TORCH_XPU_LIBRARY}
+    ${IMPI_LIBRARY}
+    ${ZE_LIBRARY}
   )
 
   if(CUTLASS_ENABLE_SYCL)

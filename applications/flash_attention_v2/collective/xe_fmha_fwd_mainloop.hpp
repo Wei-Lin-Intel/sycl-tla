@@ -152,6 +152,17 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int const* num_pages_per_seq = nullptr;
+    // ---- Ring-Attention P2P (batch == 1) ----
+    // When ring_enabled, each K/V tile loaded from global memory is also
+    // tile-copied (Xe block-2D store) into the next rank's receive buffer.
+    // The pointers below are RAW device pointers to the peer's buffer; the
+    // allocation backend (hand-written L0 IPC now, torch symm-mem later) is
+    // irrelevant to this kernel.
+    bool ring_enabled = false;
+    void* peer_k_next = nullptr;   // peer receive buffer for K, layout == K_2D
+    void* peer_v_next = nullptr;   // peer receive buffer for V, layout == V_2D
+    int   peer_k_ld = 0;           // leading (row) stride of peer K buffer, elems
+    int   peer_v_ld = 0;           // leading (row) stride of peer V buffer, elems
   };
 
   // Kernel-facing parameters
@@ -172,7 +183,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;            // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq};
+    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq,
+                  args.ring_enabled, args.peer_k_next, args.peer_v_next,
+                  args.peer_k_ld, args.peer_v_ld};
   }
 
   CUTLASS_HOST_DEVICE static
@@ -300,6 +313,37 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
     auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
 
+    /* ------ Ring-Attention: peer receive-buffer tile-store setup ------
+       Build peer K/V tensors with the SAME shape/stride as the local K_2D/V_2D
+       (batch == 1, packed). Use make_block_2d_copy_D (store variant) so the
+       just-loaded register fragments tKrK / tVrV can be tile-copied to the peer
+       at the identical (k_idx, D) / (VV, k_idx) tile coordinates. The store has
+       no data dependency on the subsequent cute::gemm, so it overlaps. */
+    using ElementK = typename TensorK2D::value_type;
+    using ElementV = typename TensorV2D::value_type;
+
+    // Peer K: (k,d) same as K_2D. Peer V: (v,k) same as V_2D.
+    Tensor peerK = make_tensor(
+        make_gmem_ptr(reinterpret_cast<ElementK*>(params.peer_k_next)),
+        make_layout(K_2D.shape(), make_stride(params.peer_k_ld, _1{})));
+    Tensor peerV = make_tensor(
+        make_gmem_ptr(reinterpret_cast<ElementV*>(params.peer_v_next)),
+        make_layout(V_2D.shape(), make_stride(params.peer_v_ld, _1{})));
+
+    // Store-flavored block-2D copies targeting the peer buffers.
+    auto copy_k_peer = make_block_2d_copy_D(mma_qk, peerK);
+    auto copy_v_peer = make_block_2d_copy_D(mma_pv, peerV);
+
+    // Partition peer tensors identically to the local gK / gV_split tiling.
+    Tensor cKpeer = make_identity_tensor(peerK.shape());              // (k,d)
+    Tensor cVpeer = make_identity_tensor(peerV.shape());              // (v,k)
+    Tensor gKpeer = local_tile(cKpeer, TileShapeQK{}, make_coord(_,_,_), Step<X,_1,_1>{}); // (k,d,K,D)
+    Tensor gVpeer = local_tile(cVpeer, tile_shape_v,  make_coord(get<1>(blk_qv),_));       // (v,k,K)
+    Tensor gVpeer_split = local_tile(gVpeer, TileShapePV{}, make_coord(_,_,0), Step<X,_1,_1>{}); // (v,k,VV,K)
+
+    auto tKpK_peer = copy_k_peer.get_slice(thr_id).partition_D(gKpeer);        // (atom,k',d',K,D)
+    auto tVpV_peer = copy_v_peer.get_slice(thr_id).partition_D(gVpeer_split);  // (atom,v',k',VV,K)
+
     // ------
     // Kernel
     // ------
@@ -359,6 +403,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_,_,_,D), tQrQ);
         copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
+	/* Ring P2P: push this K tile to the next rank. Only for the real
+           ring K/V (non-cache). No dependency with the cute::gemm below. */
+        if constexpr (!is_cache) {
+          if (params.ring_enabled) {
+            copy(copy_k_peer, tKrK, tKpK_peer(_,_,_,k_idx,D));
+          }
+        }
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
 
@@ -413,6 +464,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
+	/* Ring P2P: push this V tile to the next rank (non-cache only). */
+        if constexpr (!is_cache) {
+          if (params.ring_enabled) {
+            copy(copy_v_peer, tVrV, tVpV_peer(_,_,_,VV,k_idx));
+          }
+        }
         reorder(tVrV, tArV);
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL

@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 
 #include "xe_fmha_fwd_runner.hpp"
+#include "flash_attention_v2/comm/ring_symm.hpp"
 
 #include <array>
 #include <cmath>
@@ -87,7 +88,12 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     const int64_t *oStrides = nullptr,
                     float *externalLSE = nullptr,
                     bool accumulateOutput = false,
-                    const int64_t *lseStrides = nullptr) {
+		    const int64_t *lseStrides = nullptr,
+                    bool ringEnabled = false,
+                    void *ringPeerK = nullptr,
+                    void *ringPeerV = nullptr,
+                    int ringPeerKLd = 0,
+                    int ringPeerVLd = 0) {
   if (headSizeVO != 64 && headSizeVO != 96 && headSizeVO != 128 &&
       headSizeVO != 192) {
     return -1;
@@ -128,6 +134,11 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   options.external_o = externalO;
   options.external_lse = externalLSE;
   options.accumulate_output = accumulateOutput;
+  options.ring_enabled   = ringEnabled;
+  options.ring_peer_k    = ringPeerK;
+  options.ring_peer_v    = ringPeerV;
+  options.ring_peer_k_ld = ringPeerKLd;
+  options.ring_peer_v_ld = ringPeerVLd;
 
   if (externalLSE && lseStrides) {
     options.stride_lse_q = static_cast<int>(lseStrides[0]);
@@ -566,6 +577,46 @@ int prefillBf16Benchmark(int batch = 32, int numHeadsQ = 16, int numHeadsKV = 16
                          verify);
 }
 
+// One ring-attention round (batch == 1, non-causal).
+//
+// Attends the local Q shard against the current-buffer K/V (packed BSHD),
+// accumulates into out/lse via online softmax (round_idx > 0 => accumulate),
+// and, when ringEnabled, simultaneously tile-pushes this K/V to the next
+// rank's receive buffer.
+//
+// All *_ptr are raw device addresses (int64). Strides are [s, h, b] for
+// q/k/v/o and [q, h, b] for lse, matching prefillBf16Tensor's BHSD-view
+// convention.
+void prefillBf16RingRound(
+    int64_t q_ptr, int64_t k_ptr, int64_t v_ptr, int64_t o_ptr,
+    int64_t lse_ptr,
+    int seqLenQO, int seqLenKV,
+    int numHeadsQ, int numHeadsKV,
+    int headSizeQK, int headSizeVO,
+    int roundIdx, bool ringEnabled,
+    int64_t peerK_ptr, int64_t peerV_ptr, int peerKLd, int peerVLd,
+    std::array<int64_t, 3> qS, std::array<int64_t, 3> kS,
+    std::array<int64_t, 3> vS, std::array<int64_t, 3> oS,
+    std::array<int64_t, 3> lseS) {
+  const int ret = prefillBf16Impl(
+      /*batch=*/1, numHeadsQ, numHeadsKV, seqLenQO, seqLenKV,
+      headSizeQK, headSizeVO, /*isCausal=*/false,
+      /*iterations=*/1, /*warmup=*/0, /*verify=*/0,
+      reinterpret_cast<const void *>(q_ptr),
+      reinterpret_cast<const void *>(k_ptr),
+      reinterpret_cast<const void *>(v_ptr),
+      reinterpret_cast<void *>(o_ptr),
+      qS.data(), kS.data(), vS.data(), oS.data(),
+      lse_ptr ? reinterpret_cast<float *>(lse_ptr) : nullptr,
+      /*accumulateOutput=*/roundIdx != 0,
+      lse_ptr ? lseS.data() : nullptr,
+      /*ringEnabled=*/ringEnabled,
+      reinterpret_cast<void *>(peerK_ptr),
+      reinterpret_cast<void *>(peerV_ptr),
+      peerKLd, peerVLd);
+  TORCH_CHECK(ret == 0, "prefillBf16RingRound failed in kernel run");
+}
+
 } // namespace
 
 PYBIND11_MODULE(sycl_tla_fmha, m) {
@@ -604,4 +655,47 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("q"), py::arg("k_list"), py::arg("v_list"),
         py::arg("is_causal") = false,
         py::arg("return_lse") = false);
+
+  py::class_<RingSymmMemory>(m, "RingSymmMemory")
+      .def(py::init([](int seqKvLocal, int hKv, int dQk, int dVo,
+                       int rank, int worldSize) {
+             // NOTE: MPI must already be initialized by the caller (mpi4py).
+             return std::make_unique<RingSymmMemory>(
+                 /*batch=*/1, seqKvLocal, hKv, dQk, dVo,
+                 rank, worldSize, compat::get_default_queue());
+           }),
+           py::arg("seq_kv_local"), py::arg("h_kv"),
+           py::arg("d_qk"), py::arg("d_vo"),
+           py::arg("rank"), py::arg("world_size"))
+      .def("load_local_kv",
+           [](RingSymmMemory &s, int64_t src_k, int64_t src_v) {
+             s.load_local_kv(reinterpret_cast<const void *>(src_k),
+                             reinterpret_cast<const void *>(src_v));
+           })
+      .def("local_k", [](RingSymmMemory &s, int b) {
+        return reinterpret_cast<int64_t>(s.local_k(b));
+      })
+      .def("local_v", [](RingSymmMemory &s, int b) {
+        return reinterpret_cast<int64_t>(s.local_v(b));
+      })
+      .def("remote_k", [](RingSymmMemory &s, int peer, int b) {
+        return reinterpret_cast<int64_t>(s.remote_k(peer, b));
+      })
+      .def("remote_v", [](RingSymmMemory &s, int peer, int b) {
+        return reinterpret_cast<int64_t>(s.remote_v(peer, b));
+      })
+      .def("barrier", [](RingSymmMemory &s, int ch) { s.barrier(ch); });
+
+  m.def("prefill_bf16_ring_round", &prefillBf16RingRound,
+        "One ring-attention round: accumulate Q@current-KV into out/lse and "
+        "P2P-push the KV to the next rank.",
+        py::arg("q_ptr"), py::arg("k_ptr"), py::arg("v_ptr"), py::arg("o_ptr"),
+        py::arg("lse_ptr"), py::arg("seq_len_qo"), py::arg("seq_len_kv"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"),
+        py::arg("head_size_qk"), py::arg("head_size_vo"),
+        py::arg("round_idx"), py::arg("ring_enabled"),
+        py::arg("peer_k_ptr"), py::arg("peer_v_ptr"),
+        py::arg("peer_k_ld"), py::arg("peer_v_ld"),
+        py::arg("q_strides"), py::arg("k_strides"), py::arg("v_strides"),
+        py::arg("o_strides"), py::arg("lse_strides"));
 }
