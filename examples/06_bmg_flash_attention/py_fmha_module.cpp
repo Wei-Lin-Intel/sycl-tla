@@ -93,7 +93,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     void *ringPeerK = nullptr,
                     void *ringPeerV = nullptr,
                     int ringPeerKLd = 0,
-                    int ringPeerVLd = 0) {
+		    int ringPeerVLd = 0,
+                    bool ringConsume = false,
+                    const void *ringRecvK = nullptr,
+                    const void *ringRecvV = nullptr) {
   if (headSizeVO != 64 && headSizeVO != 96 && headSizeVO != 128 &&
       headSizeVO != 192) {
     return -1;
@@ -139,6 +142,9 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   options.ring_peer_v    = ringPeerV;
   options.ring_peer_k_ld = ringPeerKLd;
   options.ring_peer_v_ld = ringPeerVLd;
+  options.ring_consume   = ringConsume;
+  options.ring_recv_k    = ringRecvK;
+  options.ring_recv_v    = ringRecvV;
 
   if (externalLSE && lseStrides) {
     options.stride_lse_q = static_cast<int>(lseStrides[0]);
@@ -581,8 +587,16 @@ int prefillBf16Benchmark(int batch = 32, int numHeadsQ = 16, int numHeadsKV = 16
 //
 // Attends the local Q shard against the current-buffer K/V (packed BSHD),
 // accumulates into out/lse via online softmax (round_idx > 0 => accumulate),
-// and, when ringEnabled, simultaneously tile-pushes this K/V to the next
-// rank's receive buffer.
+// and, when ringEnabled, simultaneously pushes the post-reorder MMA-B
+// fragments (tSrK / tArV) to the next rank's receive buffer via a raw
+// UniversalCopy (fragment layout, not K/V layout -- see mainloop comments).
+//
+// When ringConsume is set (round_idx > 0, i.e. this rank's own receive
+// buffer was populated by the previous round's peer push), K/V for this
+// round are read directly from recvK_ptr/recvV_ptr in fragment layout,
+// skipping the global load + reorder entirely. ringRecvK/V must then be
+// non-null and k_ptr/v_ptr are ignored for the non-cache path (they may
+// still be passed for shape/stride bookkeeping but are not read).
 //
 // All *_ptr are raw device addresses (int64). Strides are [s, h, b] for
 // q/k/v/o and [q, h, b] for lse, matching prefillBf16Tensor's BHSD-view
@@ -595,6 +609,7 @@ void prefillBf16RingRound(
     int headSizeQK, int headSizeVO,
     int roundIdx, bool ringEnabled,
     int64_t peerK_ptr, int64_t peerV_ptr, int peerKLd, int peerVLd,
+    bool ringConsume, int64_t recvK_ptr, int64_t recvV_ptr,
     std::array<int64_t, 3> qS, std::array<int64_t, 3> kS,
     std::array<int64_t, 3> vS, std::array<int64_t, 3> oS,
     std::array<int64_t, 3> lseS) {
@@ -613,7 +628,10 @@ void prefillBf16RingRound(
       /*ringEnabled=*/ringEnabled,
       reinterpret_cast<void *>(peerK_ptr),
       reinterpret_cast<void *>(peerV_ptr),
-      peerKLd, peerVLd);
+      peerKLd, peerVLd,
+      /*ringConsume=*/ringConsume,
+      recvK_ptr ? reinterpret_cast<const void *>(recvK_ptr) : nullptr,
+      recvV_ptr ? reinterpret_cast<const void *>(recvV_ptr) : nullptr);
   TORCH_CHECK(ret == 0, "prefillBf16RingRound failed in kernel run");
 }
 
@@ -696,6 +714,9 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("round_idx"), py::arg("ring_enabled"),
         py::arg("peer_k_ptr"), py::arg("peer_v_ptr"),
         py::arg("peer_k_ld"), py::arg("peer_v_ld"),
+	py::arg("ring_consume") = false,
+        py::arg("recv_k_ptr") = 0,
+        py::arg("recv_v_ptr") = 0,
         py::arg("q_strides"), py::arg("k_strides"), py::arg("v_strides"),
         py::arg("o_strides"), py::arg("lse_strides"));
 }

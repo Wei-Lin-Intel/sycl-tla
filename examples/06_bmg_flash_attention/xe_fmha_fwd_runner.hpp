@@ -86,6 +86,9 @@ struct Options {
   void* ring_peer_v = nullptr;   // raw device ptr: next rank's V recv buffer
   int   ring_peer_k_ld = 0;      // row stride (elems) of peer K buffer = Hkv*Dqk
   int   ring_peer_v_ld = 0;      // row stride (elems) of peer V buffer = Hkv*Dvo
+  bool ring_consume = false;
+  void const* ring_recv_k = nullptr;
+  void const* ring_recv_v = nullptr;
 
   Options()
       : help(false), error(false), is_causal(false), print_performance(true), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
@@ -94,7 +97,7 @@ struct Options {
         external_lse(nullptr), accumulate_output(false), use_external_strides(false),
         stride_q_s(0), stride_q_h(0), stride_q_b(0), stride_k_s(0), stride_k_h(0), stride_k_b(0),
         stride_v_s(0), stride_v_h(0), stride_v_b(0), stride_o_s(0), stride_o_h(0), stride_o_b(0),
-        stride_lse_q(0), stride_lse_h(0), stride_lse_b(0) {}
+        stride_lse_q(0), stride_lse_h(0), stride_lse_b(0), ring_consume(false), ring_recv_k(nullptr), ring_recv_v(nullptr) {}
 
   // Parses the command line
   void parse(int argc, char const **args) {
@@ -836,16 +839,16 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
         block_V_cache.get(), stride_V_cache,
       },
       {
-        options.softmax_scale,
+	options.softmax_scale,
         options.use_paged_kv ? paged_kv_cache.page_table.get() : nullptr,
         options.use_paged_kv ? paged_kv_cache.page_size : 0,
-	options.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr,
-        // ---- ring (order must match Mainloop::Arguments) ----
+        options.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr,
         options.ring_enabled,
         options.ring_peer_k,
         options.ring_peer_v,
-        options.ring_peer_k_ld,
-        options.ring_peer_v_ld
+        options.ring_consume,
+        options.ring_recv_k,
+        options.ring_recv_v
       },
       {
         options.external_lse,

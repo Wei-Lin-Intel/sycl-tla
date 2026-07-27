@@ -88,6 +88,17 @@ def main():
         for t in range(world):
             cur, nxt = t % 2, (t + 1) % 2
             enabled = (t + 1 < world)
+            # Round 0 loads real K/V from global memory (via k_ptr/v_ptr) and,
+            # when enabled, pushes the post-reorder MMA-B fragments to the
+            # next rank's buf[nxt] (see mainloop's ring_enabled path).
+            # Round 1..N-1 must NOT re-load+reorder from global memory:
+            # this rank's own buf[cur] was populated by the *previous*
+            # round's peer push, already in MMA-B fragment layout. Setting
+            # ring_consume=True makes the mainloop pull tSrK/tArV straight
+            # from recv_k_ptr/recv_v_ptr instead (see mainloop ring_consume
+            # path). k_ptr/v_ptr are still passed for shape/stride purposes
+            # but their contents are not read on the consume path.
+            consume = t > 0
             fa.prefill_bf16_ring_round(
                 q_ptr=q.data_ptr(),
                 k_ptr=ring.local_k(cur), v_ptr=ring.local_v(cur),
@@ -99,6 +110,9 @@ def main():
                 peer_k_ptr=ring.remote_k(dst, nxt) if enabled else 0,
                 peer_v_ptr=ring.remote_v(dst, nxt) if enabled else 0,
                 peer_k_ld=peer_k_ld, peer_v_ld=peer_v_ld,
+                ring_consume=consume,
+                recv_k_ptr=ring.local_k(cur) if consume else 0,
+                recv_v_ptr=ring.local_v(cur) if consume else 0,
                 q_strides=qS, k_strides=kS, v_strides=vS,
                 o_strides=oS, lse_strides=lseS)
             torch.xpu.synchronize()   # compute (>= comm) done => P2P done
