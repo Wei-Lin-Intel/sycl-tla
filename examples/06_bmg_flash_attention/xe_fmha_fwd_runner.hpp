@@ -81,11 +81,14 @@ struct Options {
   int stride_lse_q, stride_lse_h, stride_lse_b;
 
   // ---- Ring-Attention P2P (batch == 1, non-causal) ----
+  // Peer K/V buffers hold raw, post-reorder MMA-B fragments (see the
+  // flat [k_tile][D_tile|VV][SG][lane][frag] convention documented in
+  // xe_fmha_fwd_mainloop.hpp), not a plain [seq,d] tile.
   bool ring_enabled = false;
   void* ring_peer_k = nullptr;   // raw device ptr: next rank's K recv buffer
   void* ring_peer_v = nullptr;   // raw device ptr: next rank's V recv buffer
-  int   ring_peer_k_ld = 0;      // row stride (elems) of peer K buffer = Hkv*Dqk
-  int   ring_peer_v_ld = 0;      // row stride (elems) of peer V buffer = Hkv*Dvo
+  int   ring_peer_k_ld = 0;      // unused by the flat fragment convention; reserved
+  int   ring_peer_v_ld = 0;      // unused by the flat fragment convention; reserved
 
   Options()
       : help(false), error(false), is_causal(false), print_performance(true), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
