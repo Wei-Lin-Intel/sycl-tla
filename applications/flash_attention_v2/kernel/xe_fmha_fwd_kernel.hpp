@@ -160,8 +160,24 @@ public:
   }
 
   static bool can_implement(Arguments const &args) {
-    return CollectiveMainloop::can_implement(args.mainloop)
-        && CollectiveEpilogue::can_implement(args.epilogue);
+    auto const& shape = args.kernel.shape;
+
+    // The Q*K head dimension is processed in TileShapeQK K-sized chunks.
+    // The current mainloop does not mask a partial final head-dimension tile,
+    // so require exact divisibility. In particular, head_size_qk=192 is
+    // supported by the 32-wide K tile used by the VO=128 configuration.
+    bool valid_shape =
+        shape.batch > 0 &&
+        shape.num_heads_q > 0 &&
+        shape.num_heads_kv > 0 &&
+        shape.num_heads_q % shape.num_heads_kv == 0 &&
+        shape.head_size_qk > 0 &&
+        shape.head_size_qk % get<2>(TileShapeQK{}) == 0 &&
+        shape.head_size_vo > 0;
+
+    return valid_shape &&
+        CollectiveMainloop::can_implement(args.mainloop) &&
+        CollectiveEpilogue::can_implement(args.epilogue);
   }
 
   static int get_workspace_size(Arguments const &args) { return 0; }
@@ -300,7 +316,7 @@ public:
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       epilogue(O(_,_,head_q,l_coord),
                tArA, tA_max, tA_sum,
-               blk_qv, thr_id);
+               blk_qv, thr_id, head_q, idx_b);
     }
   }
 };
@@ -724,7 +740,7 @@ public:
         CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
         epilogue(O(_,_,head_q,idx_b),
                 tArA, tA_max, tA_sum,
-                blk_qv, thr_id);
+                blk_qv, thr_id, head_q, idx_b);
       }
     }
   }

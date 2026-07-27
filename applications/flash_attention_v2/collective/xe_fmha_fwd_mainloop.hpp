@@ -152,6 +152,19 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int const* num_pages_per_seq = nullptr;
+    // ---- Ring-Attention P2P (batch == 1) ----
+    // When ring_enabled, the post-reorder MMA-B K/V fragments (tSrK / tArV)
+    // are raw-copied (UniversalCopy, no block-2D atom) into the next rank's
+    // receive buffer, using the flat [k_tile][D_tile|VV][SG][lane][frag]
+    // convention documented in operator() below. The pointers below are RAW
+    // device pointers to the peer's buffer; the allocation backend
+    // (hand-written L0 IPC now, torch symm-mem later) is irrelevant to this
+    // kernel.
+    bool ring_enabled = false;
+    void* peer_k_next = nullptr;   // peer receive buffer for K (flat MMA-B fragment layout)
+    void* peer_v_next = nullptr;   // peer receive buffer for V (flat MMA-B fragment layout)
+    int   peer_k_ld = 0;           // unused by the flat fragment convention; reserved
+    int   peer_v_ld = 0;           // unused by the flat fragment convention; reserved
   };
 
   // Kernel-facing parameters
@@ -172,7 +185,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;            // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq};
+    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq,
+                  args.ring_enabled, args.peer_k_next, args.peer_v_next,
+                  args.peer_k_ld, args.peer_v_ld};
   }
 
   CUTLASS_HOST_DEVICE static
@@ -300,6 +315,71 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
     auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
 
+    /* ------ Ring-Attention: peer receive-buffer raw fragment push ------
+       A register-layout probe confirmed that, after reorder(), tSrK / tArV
+       (the post-reorder MMA-B fragments consumed by cute::gemm below) are
+       DENSE, work-item-local contiguous: each work-item holds exactly
+       size(tSrK) / size(tArV) contiguous elements (their tv_layout is the
+       canonical MMA-B layout and is identical for K and V). There is no
+       transpose/VNNI flavor of a block-2D store, and the raw K_2D/V_2D load
+       register fragments (tKrK transpose-loaded, tVrV VNNI-loaded) do not
+       match any store atom's expected source layout -- so instead of
+       restoring the standard K/V layout on the peer, we push the
+       reorder-ed MMA-B fragments themselves with a raw (UniversalCopy)
+       store. Because every rank runs the same TiledMMAQK / TiledMMAPV, this
+       fragment layout is bit-identical on all ranks: in ring rounds 2..N
+       the peer can load this buffer straight back into an MMA-B fragment
+       with a raw load (no transpose/VNNI load, no reorder), and the on-wire
+       format never drifts across rounds. This also adds zero extra
+       registers / reorders on the send side: tSrK / tArV already exist, and
+       the store overlaps with the subsequent cute::gemm (no data
+       dependency between them).
+
+       Peer buffer convention (flat, per-work-item, bf16 elements):
+         Peer K: [k_tile][D_tile][SG][lane][FragElemsK]
+         Peer V: [k_tile][VV]    [SG][lane][FragElemsV]
+       where SG = thr_id / sg_size is the sub-group index within the WG,
+       lane = thr_id % sg_size is the work-item index within the sub-group,
+       and FragElemsK = size(tSrK), FragElemsV = size(tArV) (both == 64 for
+       the probed configuration; 128 bytes/work-item for bf16). Offsets
+       (element units), matching how round 2..N must index the buffer:
+         slot_K = (((k_idx*DTiles + D)*SGPerWG + SG)*sg_size + lane) * FragElemsK
+         slot_V = (((k_idx*VTiles + VV)*SGPerWG + SG)*sg_size + lane) * FragElemsV
+       Total buffer size = (#K tiles) * DTiles * SGPerWG * sg_size * FragElemsK (K)
+                          = (#K tiles) * VTiles  * SGPerWG * sg_size * FragElemsV (V)
+       DTiles collapses to 1 whenever head_size_qk fits in a single D-tile,
+       reducing to the (#K tiles) x (#SG) x 16 x 64 convention. */
+    using ElementK = typename TensorK2D::value_type;
+    using ElementV = typename TensorV2D::value_type;
+
+    constexpr int RingSGSize    = intel::sg_size;
+    constexpr int RingSGPerWG   = SGPerWG::value;
+    constexpr int RingFragElemsK = decltype(size(tSrK))::value;
+    constexpr int RingFragElemsV = decltype(size(tArV))::value;
+    int ring_sg_id   = thr_id / RingSGSize;
+    int ring_lane_id = thr_id % RingSGSize;
+    int ring_d_tiles = int(size<4>(tKgK));   // # of head-dim (D) tiles for K
+
+    ElementK* peer_k_base = reinterpret_cast<ElementK*>(params.peer_k_next);
+    ElementV* peer_v_base = reinterpret_cast<ElementV*>(params.peer_v_next);
+
+    // Push this work-item's post-reorder K MMA-B fragment (tSrK) to the
+    // peer's receive buffer at (k_idx, D). Raw bits, no block-2D atom.
+    auto ring_push_k = [&](int k_idx, int D) {
+      int slot = (((k_idx * ring_d_tiles + D) * RingSGPerWG + ring_sg_id) * RingSGSize + ring_lane_id) * RingFragElemsK;
+      Tensor peerK_frag = make_tensor(make_gmem_ptr(peer_k_base + slot),
+                                       make_layout(Shape<Int<RingFragElemsK>>{}));
+      copy(tSrK, peerK_frag);
+    };
+    // Push this work-item's post-reorder V MMA-B fragment (tArV) to the
+    // peer's receive buffer at (k_idx, VV). Raw bits, no block-2D atom.
+    auto ring_push_v = [&](int k_idx, int VV) {
+      int slot = (((k_idx * VTiles + VV) * RingSGPerWG + ring_sg_id) * RingSGSize + ring_lane_id) * RingFragElemsV;
+      Tensor peerV_frag = make_tensor(make_gmem_ptr(peer_v_base + slot),
+                                       make_layout(Shape<Int<RingFragElemsV>>{}));
+      copy(tArV, peerV_frag);
+    };
+
     // ------
     // Kernel
     // ------
@@ -361,6 +441,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
         copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
+	/* Ring P2P: push the just-reordered MMA-B K fragment (tSrK) to the
+           next rank. Only for the real ring K/V (non-cache). Reuses tSrK
+           as-is (no extra reorder); the raw store has no data dependency
+           on the cute::gemm below, so it overlaps. */
+        if constexpr (!is_cache) {
+          if (params.ring_enabled) {
+            ring_push_k(k_idx, D);
+          }
+        }
 
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
@@ -414,6 +503,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
         reorder(tVrV, tArV);
+	/* Ring P2P: push the just-reordered MMA-B V fragment (tArV) to the
+           next rank (non-cache only). Reuses tArV as-is. */
+        if constexpr (!is_cache) {
+          if (params.ring_enabled) {
+            ring_push_v(k_idx, VV);
+          }
+        }
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tArA.size() / VTiles; i++)
