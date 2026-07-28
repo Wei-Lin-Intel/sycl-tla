@@ -36,7 +36,7 @@ class RingSymmMemory {
                  int d_vo,
                  int rank,
                  int world_size,
-		 sycl::queue& q,
+		 sycl::queue q,
                  // Ring P2P fragment-layout descriptors (from the FMHA kernel):
                  //   tile_k    = Q*K K-tile length
                  //   nd_qk     = # of D sub-tiles of the Q*K MMA-B fragment
@@ -183,7 +183,7 @@ class RingSymmMemory {
   }
 
   int batch_, seq_kv_local_, h_kv_, d_qk_, d_vo_, rank_, world_size_;
-  sycl::queue& q_;
+  sycl::queue q_;
   size_t k_elems_ = 0, v_elems_ = 0, signal_elems_ = 0;
 
   uint16_t* k_buf_[2] = {nullptr, nullptr};
