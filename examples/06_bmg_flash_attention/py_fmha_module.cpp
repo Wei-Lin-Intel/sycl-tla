@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -94,7 +95,10 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     void *ringPeerV = nullptr,
                     bool ringConsume = false,
                     const void *ringRecvK = nullptr,
-                    const void *ringRecvV = nullptr) {
+	            const void *ringRecvV = nullptr,
+                    bool ringSelftest = false,
+                    void *ringSelfK = nullptr,
+                    void *ringSelfV = nullptr) {
   if (headSizeVO != 64 && headSizeVO != 96 && headSizeVO != 128 &&
       headSizeVO != 192) {
     return -1;
@@ -630,6 +634,33 @@ void prefillBf16RingRound(
   TORCH_CHECK(ret == 0, "prefillBf16RingRound failed in kernel run");
 }
 
+void prefillBf16RingSelftest(
+    uintptr_t q_ptr, uintptr_t k_ptr, uintptr_t v_ptr, uintptr_t o_ptr,
+    int seqLenQO, int seqLenKV,
+    int numHeadsQ, int numHeadsKV,
+    int headSizeQK, int headSizeVO,
+    uintptr_t self_k_ptr, uintptr_t self_v_ptr,
+    std::array<int64_t, 3> qS, std::array<int64_t, 3> kS,
+    std::array<int64_t, 3> vS, std::array<int64_t, 3> oS) {
+  const int ret = prefillBf16Impl(
+      /*batch=*/1, numHeadsQ, numHeadsKV, seqLenQO, seqLenKV,
+      headSizeQK, headSizeVO, /*isCausal=*/false,
+      /*iterations=*/1, /*warmup=*/0, /*verify=*/0,
+      reinterpret_cast<const void *>(q_ptr),
+      reinterpret_cast<const void *>(k_ptr),
+      reinterpret_cast<const void *>(v_ptr),
+      reinterpret_cast<void *>(o_ptr),
+      qS.data(), kS.data(), vS.data(), oS.data(),
+      /*externalLSE=*/nullptr, /*accumulateOutput=*/false,
+      /*lseStrides=*/nullptr,
+      /*ringEnabled=*/false, /*ringPeerK=*/nullptr, /*ringPeerV=*/nullptr,
+      /*ringConsume=*/false, /*ringRecvK=*/nullptr, /*ringRecvV=*/nullptr,
+      /*ringSelftest=*/true,
+      reinterpret_cast<void *>(self_k_ptr),
+      reinterpret_cast<void *>(self_v_ptr));
+  TORCH_CHECK(ret == 0, "prefillBf16RingSelftest failed in kernel run");
+}
+
 } // namespace
 
 PYBIND11_MODULE(sycl_tla_fmha, m) {
@@ -678,13 +709,12 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
              //   NumThreadsQK = size(TiledMMAQK) = 16 * 16 = 256
              //   TileK = 32  ->  nd_qk = 128 / 32 = 4
              //   VTiles = 128 / 32 = 4
-             //   frag  = RingFragElems = 64
              // These MUST match the mainloop's slot formula and MMA config.
              constexpr int kTileK   = 32;
              constexpr int kNdQk    = 4;
              constexpr int kVTiles  = 4;
              constexpr int kThreads = 256;
-             constexpr int kFrag    = 64;
+             constexpr int kFrag    = 128;
              return std::make_unique<RingSymmMemory>(
                  /*batch=*/1, seqKvLocal, hKv, dQk, dVo,
 		 rank, worldSize, compat::get_default_queue(),
@@ -727,4 +757,35 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("recv_v_ptr") = 0,
         py::arg("q_strides"), py::arg("k_strides"), py::arg("v_strides"),
         py::arg("o_strides"), py::arg("lse_strides"));
+
+  m.def("prefill_bf16_ring_selftest", &prefillBf16RingSelftest,
+        "world=1 inline self-loopback: push each K/V fragment to a LOCAL "
+        "buffer and pull it straight back before GEMM; result must equal a "
+        "plain prefill if push/pull is correct.",
+        py::arg("q_ptr"), py::arg("k_ptr"), py::arg("v_ptr"), py::arg("o_ptr"),
+        py::arg("seq_len_qo"), py::arg("seq_len_kv"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"),
+        py::arg("head_size_qk"), py::arg("head_size_vo"),
+        py::arg("self_k_ptr"), py::arg("self_v_ptr"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"));
+  m.def("ipc_export", [](uintptr_t ptr) -> py::bytes {
+    ze_ipc_mem_handle_t h{};
+    auto q = compat::get_default_queue();
+    auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+    ZE_CHECK(zeMemGetIpcHandle(ze_ctx, reinterpret_cast<void*>(ptr), &h));
+    return py::bytes(reinterpret_cast<const char*>(&h), sizeof(h));
+  });
+
+  m.def("ipc_import", [](py::bytes handle) -> uintptr_t {
+    ze_ipc_mem_handle_t h{};
+    std::string s = handle;
+    std::memcpy(&h, s.data(), sizeof(h));
+    auto q = compat::get_default_queue();
+    auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+    auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+    void* p = nullptr;
+    ZE_CHECK(zeMemOpenIpcHandle(ze_ctx, ze_dev, h, 0, &p));
+    return reinterpret_cast<uintptr_t>(p);
+  });
 }

@@ -151,9 +151,6 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   using RingValType = typename TiledMMAQK::ValTypeB;
   static_assert(cute::is_same_v<RingValType, typename TiledMMAPV::ValTypeB>,
                 "Ring P2P requires identical K/V MMA-B element types");
-  static constexpr int RingFragElems = 64;
-  using RingCopyAtom = Copy_Atom<UniversalCopy<cutlass::AlignedArray<RingValType, RingFragElems>>,
-                                  RingValType>;
   // Total work-items participating in the Q*K tile (== P*V tile, same WG).
   static constexpr int NumThreadsQK = size(TiledMMAQK{});
 
@@ -188,6 +185,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     bool ring_consume = false;
     void const* ring_recv_k = nullptr; // this rank's local K recv buffer
     void const* ring_recv_v = nullptr; // this rank's local V recv buffer
+    bool ring_selftest = false;
+    void* ring_self_k = nullptr;
+    void* ring_self_v = nullptr;
   };
 
   // Kernel-facing parameters
@@ -210,7 +210,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq,
                   args.ring_enabled, args.peer_k_next, args.peer_v_next,
-                  args.ring_consume, args.ring_recv_k, args.ring_recv_v};
+                  args.ring_consume, args.ring_recv_k, args.ring_recv_v,
+		  args.ring_selftest, args.ring_self_k, args.ring_self_v};
   }
 
   CUTLASS_HOST_DEVICE static
@@ -347,7 +348,10 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     RingValType* peerVBuf = reinterpret_cast<RingValType*>(params.peer_v_next);
     RingValType const* recvKBuf = reinterpret_cast<RingValType const*>(params.ring_recv_k);
     RingValType const* recvVBuf = reinterpret_cast<RingValType const*>(params.ring_recv_v);
+    RingValType* selfKBuf = reinterpret_cast<RingValType*>(params.ring_self_k);
+    RingValType* selfVBuf = reinterpret_cast<RingValType*>(params.ring_self_v);
 
+    /*
     auto push_ring_frag = [&](auto& frag, RingValType* peer_base, int slot) {
       // frag coalesces to (_64:_1): reinterpret it as a flat 64-elem rmem
       // tensor referencing the same underlying array (no copy, no reorder).
@@ -362,6 +366,23 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
                                    Layout<Shape<Int<RingFragElems>>>{});
       Tensor frag_flat = make_tensor(frag.data(), Layout<Shape<Int<RingFragElems>>>{});
       copy(RingCopyAtom{}, peer_t, frag_flat);
+    };
+    */
+
+    auto push_ring_frag = [&](auto& frag, RingValType* peer_base, int slot) {
+      using FragT = remove_cvref_t<decltype(frag)>;
+      constexpr int N = cute::size(typename FragT::layout_type{});
+      RingValType* dst = peer_base + slot * N;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < N; ++i) dst[i] = frag(i);
+    };
+
+    auto pull_ring_frag = [&](auto& frag, RingValType const* peer_base, int slot) {
+      using FragT = remove_cvref_t<decltype(frag)>;
+      constexpr int N = cute::size(typename FragT::layout_type{});
+      RingValType const* src = peer_base + slot * N;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < N; ++i) frag(i) = src[i];
     };
 
     // ------
@@ -457,6 +478,14 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
 	      push_ring_frag(tSrK, peerKBuf,
                   (((ring_head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK) + thr_id);
             }
+	    // Self-loopback (world_size==1): push tSrK to a LOCAL buffer,
+            // then pull it straight back into tSrK before the GEMM. Result
+            // must be bit-identical to the plain reorder path.
+            if (params.ring_selftest) {
+              int slot = (((ring_head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK) + thr_id;
+              push_ring_frag(tSrK, selfKBuf, slot);
+              pull_ring_frag(tSrK, selfKBuf, slot);
+            }
           }
         } else {
           copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
@@ -529,6 +558,11 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
             if (params.ring_enabled) {
 	      push_ring_frag(tArV, peerVBuf,
                   (((ring_head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK) + thr_id);
+            }
+	    if (params.ring_selftest) {
+              int slot = (((ring_head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK) + thr_id;
+              push_ring_frag(tArV, selfVBuf, slot);
+              pull_ring_frag(tArV, selfVBuf, slot);
             }
           }
         } else {

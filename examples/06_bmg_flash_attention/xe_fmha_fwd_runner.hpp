@@ -88,6 +88,10 @@ struct Options {
   void const* ring_recv_k = nullptr;
   void const* ring_recv_v = nullptr;
 
+  bool ring_selftest = false;
+  void* ring_self_k = nullptr;
+  void* ring_self_v = nullptr;
+
   Options()
       : help(false), error(false), is_causal(false), print_performance(true), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
         seq_len_kv(512), seq_len_kv_cache(0), page_size(128), head_size_vo(128), iterations(100), warmup(100), softmax_scale(1.f), verify(1), scheduler("Individual"),
@@ -112,6 +116,10 @@ struct Options {
 
     if (cmd.check_cmd_line_flag("varlen")) {
       varlen = true;
+    }
+
+    if (cmd.check_cmd_line_flag("ring_selftest")) {
+      ring_selftest = true;
     }
 
     cmd.get_cmd_line_argument("scheduler", scheduler, std::string("Individual"));
@@ -257,6 +265,11 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   cutlass::DeviceAllocation<ElementO> block_O;
   cutlass::DeviceAllocation<ElementO> block_ref_O;
   cutlass::device_memory::allocation<uint8_t> workspace;
+
+  // Ring self-loopback scratch (bf16 = RingValType). Sized to the full K/V
+  // tensors, which is a safe upper bound for the per-slot serialized form.
+  cutlass::DeviceAllocation<ElementK> ring_self_k_buf;
+  cutlass::DeviceAllocation<ElementV> ring_self_v_buf;
 
   std::vector<int> cumulative_seqlen_q;
   std::vector<int> cumulative_seqlen_kv;
@@ -686,6 +699,13 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
     ensureCapacity(block_K_cache, kCacheElements);
     ensureCapacity(block_V_cache, vCacheElements);
     ensureCapacity(block_O, oElements);
+
+    if (options.ring_selftest) {
+      // Upper bound: full K/V element counts (batch==1 for ring scope).
+      ensureCapacity(ring_self_k_buf, kElements);
+      ensureCapacity(ring_self_v_buf, vElements);
+    }
+
     if (options.verify != 0) {
       ensureCapacity(block_ref_O, oElements);
     }
@@ -846,7 +866,10 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
         options.ring_peer_v,
         options.ring_consume,
         options.ring_recv_k,
-        options.ring_recv_v
+        options.ring_recv_v,
+        options.ring_selftest,
+        options.ring_selftest ? static_cast<void*>(ring_self_k_buf.get()) : nullptr,
+        options.ring_selftest ? static_cast<void*>(ring_self_v_buf.get()) : nullptr
       },
       {
         options.external_lse,
