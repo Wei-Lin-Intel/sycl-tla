@@ -344,40 +344,17 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     // sub-block. ring_head_idx = head index for this WG (batch==1 ring scope).
     // K packed row stride = h_kv * d_qk, so head h starts at h * d_qk within
     // each row; V packed row stride = h_kv * d_vo -> h * d_vo.
-    /*
     auto make_recvK_2D = [&]() {
       auto base = reinterpret_cast<RingElemK const*>(params.ring_recv_k);
-      // K_2D shape=(k,d), stride=(row_stride, 1). row_stride == h_kv*d_qk for
-      // the packed buffer; this head's columns start at ring_head_idx*d.
       int d = get<1>(K_2D.shape());
       auto ptr = make_gmem_ptr(base + static_cast<int64_t>(ring_head_idx) * d);
       return make_tensor(ptr, make_layout(K_2D.shape(), K_2D.stride()));
     };
     auto make_recvV_2D = [&]() {
       auto base = reinterpret_cast<RingElemV const*>(params.ring_recv_v);
-      // V_2D shape=(v,k) with stride (1, row_stride). V is stored [d,k] packed,
-      // so this head's rows start at ring_head_idx*d_vo (= v extent).
       int v = get<0>(V_2D.shape());
       auto ptr = make_gmem_ptr(base + static_cast<int64_t>(ring_head_idx) * v);
       return make_tensor(ptr, make_layout(V_2D.shape(), V_2D.stride()));
-    };
-    */
-    auto make_recvK_2D = [&]() {
-      auto base = reinterpret_cast<RingElemK const*>(params.ring_recv_k);
-      int d = get<1>(K_2D.shape());
-      int k = get<0>(K_2D.shape());
-      auto ptr = make_gmem_ptr(base + static_cast<int64_t>(ring_head_idx) * d);
-      // 验证 B:seq 维加 padding,吸收 block-2D 越界访问
-      auto padded_shape  = make_shape(k + get<1>(TileShapeQK{}) * 4, d);
-      return make_tensor(ptr, make_layout(padded_shape, K_2D.stride()));
-    };
-    auto make_recvV_2D = [&]() {
-      auto base = reinterpret_cast<RingElemV const*>(params.ring_recv_v);
-      int v = get<0>(V_2D.shape());
-      int k = get<1>(V_2D.shape());
-      auto ptr = make_gmem_ptr(base + static_cast<int64_t>(ring_head_idx) * v);
-      auto padded_shape  = make_shape(v, k + get<1>(TileShapeQK{}) * 4);
-      return make_tensor(ptr, make_layout(padded_shape, V_2D.stride()));
     };
 
     /* ------ Ring-Attention P2P: hoist recv tensor/copy/partition setup ------
@@ -425,7 +402,6 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
        ring_head : head index for this WG (ring scope is batch==1, so l_coord
                    enumerates heads only).
        kTilesRing : # of non-cache (ring) K tiles. */
-
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_,_,_,D));
     }
