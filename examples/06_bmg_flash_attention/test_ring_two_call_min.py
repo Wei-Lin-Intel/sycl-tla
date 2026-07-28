@@ -70,7 +70,8 @@ def main():
     tmp      = torch.empty_like(out_self)
     lse = torch.empty(1, Hq, S, device=dev, dtype=torch.float32)
     oS = bshd_strides(out_base)
-    lseS = [lse.stride(2), lse.stride(1), lse.stride(0)]
+    lseS = [lse.stride(1), lse.stride(2), lse.stride(0)]
+#    lseS = [lse.stride(2), lse.stride(1), lse.stride(0)]
 
     # self buffer 按 128 精确上界分配(slot = ((head*kTiles + k_idx)*nD_qk + D)*threads + thr)
     kTiles = (S + TileK - 1) // TileK

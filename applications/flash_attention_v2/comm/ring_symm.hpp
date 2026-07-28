@@ -166,8 +166,16 @@ class RingSymmMemory {
   void make_resident() {
     auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_.get_context());
     auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_.get_device());
-    auto resident = [&](void* p, size_t bytes) {
-      if (p) ZE_CHECK(zeContextMakeMemoryResident(ze_ctx, ze_dev, p, bytes));
+    // zeContextMakeMemoryResident must cover the *entire allocation block*,
+    // addressed by its base pointer, not the (base+offset) view returned by
+    // exchange_ipc_ptrs. Passing base+offset with the buffer size overruns the
+    // mapped IPC region for large buffers -> SIGSEGV. Re-query base+size.
+    auto resident = [&](void* p, size_t /*bytes*/) {
+      if (!p) return;
+      void* base = nullptr;
+      size_t base_size = 0;
+      ZE_CHECK(zeMemGetAddressRange(ze_ctx, p, &base, &base_size));
+      ZE_CHECK(zeContextMakeMemoryResident(ze_ctx, ze_dev, base, base_size));
     };
     for (int b = 0; b < 2; ++b) {
       for (int peer = 0; peer < world_size_; ++peer) {

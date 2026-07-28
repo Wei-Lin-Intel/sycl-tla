@@ -252,6 +252,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
              int              l_coord,
              int              full_tile_offset,
              int              discard_seq_coord,
+	     int              ring_head_idx = 0,
             TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
             TensorV_cache2D const& V_cache_2D = TensorV_cache2D{}) {
     using namespace sycl::ext::oneapi::this_work_item;
@@ -402,7 +403,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
                    enumerates heads only).
        kTilesRing : # of non-cache (ring) K tiles. */
     int const nD_qk      = size<4>(tKgK);
-    int const ring_head  = l_coord;
+    int const ring_head  = ring_head_idx;
     int const kTilesRing = total_blk - kblocks_cache;
 
     for (int D = 0; D < size<3>(pQgQ); D++) {
