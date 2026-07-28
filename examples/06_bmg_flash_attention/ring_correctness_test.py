@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from mpi4py import MPI
 import sycl_tla_fmha as fa
-
+import time
 
 def bshd_strides(t):
     v = t.permute(0, 2, 1, 3)
@@ -48,8 +48,9 @@ def main():
 
     # 每个 rank 用不同 seed 生成自己的 local shard(randn),再通过 Allgather
     # 拼成 full 张量给后面的 PyTorch SDPA 做 verify。
-    torch.manual_seed(a.seed + rank)
+    torch.manual_seed(a.seed)
     q_local_f = torch.randn(1, s_local, Hq,  Dqk, dtype=torch.float32)
+    torch.manual_seed(a.seed + rank)
     k_local_f = torch.randn(1, s_local, Hkv, Dqk, dtype=torch.float32)
     v_local_f = torch.randn(1, s_local, Hkv, Dvo, dtype=torch.float32)
 
@@ -104,8 +105,8 @@ def main():
         fa.prefill_bf16_ring_round(
             q_ptr=q.data_ptr(),
             # 始终消费本 rank 当前 packed buffer。
-            k_ptr=ring.local_k(cur),
-            v_ptr=ring.local_v(cur),
+            k_ptr=k_local.data_ptr(), #ring.local_k(cur),
+            v_ptr=v_local.data_ptr(), #ring.local_v(cur),
             o_ptr=out.data_ptr(), lse_ptr=lse.data_ptr(),
             seq_len_qo=s_local, seq_len_kv=s_local,
             num_heads_q=Hq, num_heads_kv=Hkv,
@@ -142,9 +143,9 @@ def main():
         ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=False).transpose(1, 2).contiguous()
     torch.xpu.synchronize()
 
-#    print(out)
-#    print()
-#    print(ref)
+    print(out)
+    print()
+    print(ref)
 
     # 用 cosine similarity 判定:把每个 (batch, head, query) 的 head-dim 向量
     # 当作一条向量,沿 head-dim(最后一维)算 cos 相似度。这样对 bf16 的幅度

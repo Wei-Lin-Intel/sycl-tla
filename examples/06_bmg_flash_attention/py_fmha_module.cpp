@@ -727,7 +727,7 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
       .def("remote_v", [](RingSymmMemory &s, int peer, int b) {
         return reinterpret_cast<uintptr_t>(s.remote_v(peer, b));
       })
-      .def("barrier", [](RingSymmMemory &s, int ch) { s.barrier(ch); })
+      .def("barrier", [](RingSymmMemory &s, int ch) { s.barrier(ch).wait(); })
       .def("push_packed", [](RingSymmMemory &s, int dst, int src_b, int dst_b) {
         s.push_packed(dst, src_b, dst_b).wait();
       }, py::arg("dst"), py::arg("src_b"), py::arg("dst_b"))
