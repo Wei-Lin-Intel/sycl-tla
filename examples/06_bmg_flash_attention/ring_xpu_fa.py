@@ -100,7 +100,12 @@ def main():
             consume = t > 0
             fa.prefill_bf16_ring_round(
                 q_ptr=q.data_ptr(),
-                k_ptr=ring.local_k(cur), v_ptr=ring.local_v(cur),
+#                k_ptr=ring.local_k(cur), v_ptr=ring.local_v(cur),
+                # Round 0 reads the real packed KV (this rank's own shard).
+                # Rounds >=1 read from buf[cur] in fragment layout via
+                # ring_consume; k_ptr/v_ptr are then ignored by the kernel.
+                k_ptr=(k_local.data_ptr() if t == 0 else ring.local_k(cur)),
+                v_ptr=(v_local.data_ptr() if t == 0 else ring.local_v(cur)),
                 o_ptr=out.data_ptr(), lse_ptr=lse.data_ptr(),
                 seq_len_qo=s_local, seq_len_kv=s_local,
                 num_heads_q=Hq, num_heads_kv=Hkv,

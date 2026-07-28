@@ -673,9 +673,22 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
       .def(py::init([](int seqKvLocal, int hKv, int dQk, int dVo,
                        int rank, int worldSize) {
              // NOTE: MPI must already be initialized by the caller (mpi4py).
+	     // Ring P2P fragment-layout constants for the head_dim=128 case:
+             //   ShapeQK=<256,32,32>, SubgroupLayoutQK=<16,1,1>
+             //   NumThreadsQK = size(TiledMMAQK) = 16 * 16 = 256
+             //   TileK = 32  ->  nd_qk = 128 / 32 = 4
+             //   VTiles = 128 / 32 = 4
+             //   frag  = RingFragElems = 64
+             // These MUST match the mainloop's slot formula and MMA config.
+             constexpr int kTileK   = 32;
+             constexpr int kNdQk    = 4;
+             constexpr int kVTiles  = 4;
+             constexpr int kThreads = 256;
+             constexpr int kFrag    = 64;
              return std::make_unique<RingSymmMemory>(
                  /*batch=*/1, seqKvLocal, hKv, dQk, dVo,
-                 rank, worldSize, compat::get_default_queue());
+		 rank, worldSize, compat::get_default_queue(),
+                 kTileK, kNdQk, kVTiles, kThreads, kFrag);
            }),
            py::arg("seq_kv_local"), py::arg("h_kv"),
            py::arg("d_qk"), py::arg("d_vo"),
