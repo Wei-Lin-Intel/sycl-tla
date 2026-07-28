@@ -416,9 +416,12 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
             prefetch(prefetch_k_cache, pKgK_cache(_,_,_,K,D));
           }
         } else {
-	  // Non-cache (ring) K: skip global prefetch when consuming from the
-          // peer recv buffer (that memory is not read this round).
-          if (!params.ring_consume) {
+	  // Non-cache (ring) K: when consuming this round, the K tile is read
+          // from the peer recv buffer, so prime the prefetch from pKgK_recv;
+          // otherwise prefetch global K. Mirrors the in-loop K prefetch below.
+          if (params.ring_consume) {
+            prefetch(prefetch_k_recv, pKgK_recv(_,_,_,K - kblocks_cache,D));
+          } else {
             prefetch(prefetch_k, pKgK(_,_,_,K - kblocks_cache,D));
           }
         }
