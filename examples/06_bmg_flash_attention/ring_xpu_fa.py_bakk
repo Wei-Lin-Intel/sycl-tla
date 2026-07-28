@@ -1,34 +1,115 @@
 #!/usr/bin/env python3
 #
 # Ring Attention (sequence-parallel, non-causal) on XPU.
-#   mpirun -n <P> python ring_xpu_fa.py --q-seq-len 32768 [...]
+#   mpirun -n <P> python ring_xpu_fa.py --q-seq-len 4096 [...]
 #
-# Cross-round accumulation reuses the LSE-update (online softmax) path already
-# validated by xpu_kv_fa.py (accumulate_output + shared external LSE).
+# Uses torch.distributed (xccl/ccl backend) for the host-side barrier, driven
+# by MPI launcher env vars (PMI_* / OMPI_*). No mpi4py dependency.
+#
+# Locked to the validated case: head_dim(QK)=head_dim(VO)=128, TileK=32.
+# The RingSymmMemory fragment-layout constants (nd_qk=4, vtiles=4,
+# threads=256, frag=64) are baked into py_fmha_module.cpp for this case.
 
 import argparse
+import os
 import time
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from mpi4py import MPI
 
 import sycl_tla_fmha as fa
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Ring Attention on XPU")
-    p.add_argument("--q-seq-len", type=int, default=32768,
+    p.add_argument("--q-seq-len", type=int, default=4096,
                    help="GLOBAL sequence length (must be divisible by world_size)")
-    p.add_argument("--q-nhead", type=int, default=40)
-    p.add_argument("--kv-nhead", type=int, default=40)
+    p.add_argument("--q-nhead", type=int, default=8)
+    p.add_argument("--kv-nhead", type=int, default=8)
     p.add_argument("--qk-hdim", type=int, default=128)
     p.add_argument("--v-hdim", type=int, default=128, choices=(64, 96, 128, 192))
+    p.add_argument("--backend", type=str, default="xccl",
+                   help="torch.distributed backend (xccl or ccl)")
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--loops", type=int, default=10)
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--seed", type=int, default=2026)
     return p.parse_args()
+
+
+def _detect_mpi_env():
+    """
+    Derive (rank, world_size, local_rank) from the MPI launcher environment.
+    Supports torchrun (RANK/WORLD_SIZE), Intel MPI/MPICH (PMI_*), OpenMPI
+    (OMPI_*). Falls back to single-process.
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+        return rank, world_size, local_rank
+
+    if "PMI_RANK" in os.environ:
+        rank = int(os.environ["PMI_RANK"])
+        world_size = int(os.environ.get("PMI_SIZE", "1"))
+        local_rank = int(os.environ.get("MPI_LOCALRANKID", str(rank)))
+        return rank, world_size, local_rank
+
+    if "OMPI_COMM_WORLD_RANK" in os.environ:
+        rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+        world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", str(rank)))
+        return rank, world_size, local_rank
+
+    return 0, 1, 0
+
+
+def init_distributed(backend):
+    if not hasattr(torch, "xpu") or not torch.xpu.is_available():
+        raise RuntimeError("No available Intel XPU device was detected")
+
+    if backend == "ccl":
+        try:
+            import oneccl_bindings_for_pytorch  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Failed to import oneccl_bindings_for_pytorch. Install a "
+                "torch-ccl build matching torch/Python/XPU runtime versions."
+            ) from exc
+
+    rank, world_size, local_rank = _detect_mpi_env()
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+
+    if local_rank >= torch.xpu.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank}, but only "
+            f"{torch.xpu.device_count()} XPU devices are visible"
+        )
+
+    torch.xpu.set_device(local_rank)
+
+    if not dist.is_initialized():
+        process_group_backend = f"xpu:{backend}" if backend == "ccl" else backend
+        dist.init_process_group(
+            backend=process_group_backend,
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+        )
+
+    return rank, local_rank, world_size
+
+
+def distributed_barrier():
+    torch.xpu.synchronize()
+    dist.barrier()
+    torch.xpu.synchronize()
 
 
 def bshd_strides(t):
@@ -44,12 +125,9 @@ def lse_strides(lse):
 
 def main():
     args = parse_args()
-    comm = MPI.COMM_WORLD
-    rank, world = comm.Get_rank(), comm.Get_size()
 
-    assert torch.xpu.is_available(), "no XPU"
-    torch.xpu.set_device(rank)          # one rank per device
-    device = torch.device("xpu", rank)
+    rank, local_rank, world = init_distributed(args.backend)
+    device = torch.device("xpu", local_rank)
     dtype = torch.bfloat16
 
     assert args.q_seq_len % world == 0, "--q-seq-len must be divisible by world_size"
@@ -81,21 +159,13 @@ def main():
     kS, vS = bshd_strides(k_local), bshd_strides(v_local)
 
     def run_ring_once():
+        # NOTE: load_local_kv is a no-op with fragment-layout buffers; round 0
+        # reads its real packed KV directly from k_local/v_local below.
         ring.load_local_kv(k_local.data_ptr(), v_local.data_ptr())
-        comm.Barrier()
+        distributed_barrier()
         for t in range(world):
             cur, nxt = t % 2, (t + 1) % 2
             enabled = (t + 1 < world)
-            # Round 0 loads real K/V from global memory (via k_ptr/v_ptr) and,
-            # when enabled, pushes the post-reorder MMA-B fragments to the
-            # next rank's buf[nxt] (see mainloop's ring_enabled path).
-            # Round 1..N-1 must NOT re-load+reorder from global memory:
-            # this rank's own buf[cur] was populated by the *previous*
-            # round's peer push, already in MMA-B fragment layout. Setting
-            # ring_consume=True makes the mainloop pull tSrK/tArV straight
-            # from recv_k_ptr/recv_v_ptr instead (see mainloop ring_consume
-            # path). k_ptr/v_ptr are still passed for shape/stride purposes
-            # but their contents are not read on the consume path.
             consume = t > 0
             fa.prefill_bf16_ring_round(
                 q_ptr=q.data_ptr(),
@@ -116,30 +186,19 @@ def main():
                 recv_v_ptr=ring.local_v(cur) if consume else 0,
                 q_strides=qS, k_strides=kS, v_strides=vS,
                 o_strides=oS, lse_strides=lseS)
-            torch.xpu.synchronize()
-            ring.barrier(0)
-            comm.Barrier()
-            if t + 1 < world:
-                # 用一次 device 端 copy 强制 IPC 内存同步可见
-                _ = ring.local_k(nxt)  # 或加一次显式 memcpy/flush
-            torch.xpu.synchronize()
-            comm.Barrier()
-            # DIAGNOSTIC: over-synchronize to test if this is a race.
-            for _ in range(5):
-                torch.xpu.synchronize()
-                comm.Barrier()
-            import time as _t; _t.sleep(0.01)
+            torch.xpu.synchronize()   # compute (>= comm) done => P2P done
+            ring.barrier(0)           # confirm peers finished writing
+            dist.barrier()            # round boundary (the only host lock)
 
     for _ in range(args.warmup):
         run_ring_once()
-    torch.xpu.synchronize()
-    comm.Barrier()
+    distributed_barrier()
 
     start = time.perf_counter()
     for _ in range(args.loops):
         run_ring_once()
     torch.xpu.synchronize()
-    comm.Barrier()
+    dist.barrier()
     elapsed = time.perf_counter() - start
     avg_ms = elapsed / args.loops * 1e3
     flops = 2 * 1 * Hq * s_local * args.q_seq_len * (Dqk + Dvo)
@@ -151,8 +210,7 @@ def main():
     if not args.skip_verify:
         with torch.no_grad():
             qb = q.transpose(1, 2)
-            # round0-only: reference against THIS rank's local K/V shard only.
-            kb, vb = k_local.transpose(1, 2), v_local.transpose(1, 2)
+            kb, vb = k_full.transpose(1, 2), v_full.transpose(1, 2)
             if qb.size(1) != kb.size(1):
                 g = qb.size(1) // kb.size(1)
                 kb = kb.repeat_interleave(g, dim=1)
@@ -160,17 +218,12 @@ def main():
             ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=False)
             ref = ref.transpose(1, 2).contiguous()
         torch.xpu.synchronize()
-        diff = (out.float() - ref.float()).abs()
-        bad = diff > 0.05
-        # 错误在 head-dim(D=128)的哪些位置?
-        bad_d = bad.any(dim=(0,1,2)).nonzero().flatten()
-        print(f"[rank {rank}] bad head-dim positions: {bad_d.tolist()}")
-        # 每个 D 位置的错误计数
-        cnt = bad.sum(dim=(0,1,2))
-        print(f"[rank {rank}] per-D bad count: {cnt.tolist()}")
         torch.testing.assert_close(out.float(), ref.float(), atol=5e-2, rtol=5e-2)
-        print(f"[ring][rank {rank}] round0 PASSED")
+        md = (out.float() - ref.float()).abs().max().item()
+        print(f"[ring][rank {rank}] PASSED  max_abs_diff={md:.3e}")
 
+    distributed_barrier()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

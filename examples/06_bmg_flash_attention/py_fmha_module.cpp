@@ -598,14 +598,14 @@ int prefillBf16Benchmark(int batch = 32, int numHeadsQ = 16, int numHeadsKV = 16
 // q/k/v/o and [q, h, b] for lse, matching prefillBf16Tensor's BHSD-view
 // convention.
 void prefillBf16RingRound(
-    int64_t q_ptr, int64_t k_ptr, int64_t v_ptr, int64_t o_ptr,
-    int64_t lse_ptr,
+    uintptr_t q_ptr, uintptr_t k_ptr, uintptr_t v_ptr, uintptr_t o_ptr,
+    uintptr_t lse_ptr,
     int seqLenQO, int seqLenKV,
     int numHeadsQ, int numHeadsKV,
     int headSizeQK, int headSizeVO,
     int roundIdx, bool ringEnabled,
-    int64_t peerK_ptr, int64_t peerV_ptr,
-    bool ringConsume, int64_t recvK_ptr, int64_t recvV_ptr,
+    uintptr_t peerK_ptr, uintptr_t peerV_ptr,
+    bool ringConsume, uintptr_t recvK_ptr, uintptr_t recvV_ptr,
     std::array<int64_t, 3> qS, std::array<int64_t, 3> kS,
     std::array<int64_t, 3> vS, std::array<int64_t, 3> oS,
     std::array<int64_t, 3> lseS) {
@@ -694,21 +694,22 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
            py::arg("d_qk"), py::arg("d_vo"),
            py::arg("rank"), py::arg("world_size"))
       .def("load_local_kv",
-           [](RingSymmMemory &s, int64_t src_k, int64_t src_v) {
+           [](RingSymmMemory &s, uintptr_t src_k, uintptr_t src_v) {
              s.load_local_kv(reinterpret_cast<const void *>(src_k),
                              reinterpret_cast<const void *>(src_v));
-           })
+           },
+	   py::arg("src_k"), py::arg("src_v"))
       .def("local_k", [](RingSymmMemory &s, int b) {
-        return reinterpret_cast<int64_t>(s.local_k(b));
+        return reinterpret_cast<uintptr_t>(s.local_k(b));
       })
       .def("local_v", [](RingSymmMemory &s, int b) {
-        return reinterpret_cast<int64_t>(s.local_v(b));
+        return reinterpret_cast<uintptr_t>(s.local_v(b));
       })
       .def("remote_k", [](RingSymmMemory &s, int peer, int b) {
-        return reinterpret_cast<int64_t>(s.remote_k(peer, b));
+        return reinterpret_cast<uintptr_t>(s.remote_k(peer, b));
       })
       .def("remote_v", [](RingSymmMemory &s, int peer, int b) {
-        return reinterpret_cast<int64_t>(s.remote_v(peer, b));
+        return reinterpret_cast<uintptr_t>(s.remote_v(peer, b));
       })
       .def("barrier", [](RingSymmMemory &s, int ch) { s.barrier(ch); });
 
