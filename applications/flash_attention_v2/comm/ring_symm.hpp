@@ -36,7 +36,7 @@ class RingSymmMemory {
                  int d_vo,
                  int rank,
                  int world_size,
-		 sycl::queue q,
+                 sycl::queue q,
                  // Ring P2P fragment-layout descriptors (from the FMHA kernel):
                  //   tile_k    = Q*K K-tile length
                  //   nd_qk     = # of D sub-tiles of the Q*K MMA-B fragment
@@ -53,7 +53,7 @@ class RingSymmMemory {
         d_vo_(d_vo),
         rank_(rank),
         world_size_(world_size),
-	q_(q),
+        q_(q),
         // Dedicated copy queue so ring pushes (packed IPC memcpy) can overlap
         // with the attention kernel running on the compute queue. Binding a
         // separate in-order queue lets the runtime schedule these memcpys on
@@ -64,8 +64,23 @@ class RingSymmMemory {
     // tile, identical to the caller's torch K/V tensor. The kernel loads +
     // reorders it exactly like global memory, so no fragment-layout blow-up.
     (void)tile_k; (void)nd_qk; (void)vtiles; (void)threads; (void)frag;
-    k_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_qk_;
-    v_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_vo_;
+
+    // Effective (valid) element counts: the exact size of the caller's packed
+    // K/V tile. These are used for every host<->buffer / buffer<->peer memcpy
+    // so we never read past the caller's torch tensor or write past the peer's
+    // valid region.
+    k_valid_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_qk_;
+    v_valid_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_vo_;
+
+    // Allocation size = valid + tail padding. The padding gives the FMHA
+    // kernel's recv-path block-2D loads slack at the end of the buffer so an
+    // out-of-bounds tile read on the last K-block stays inside a legal
+    // allocation instead of faulting. The padding region is NEVER copied
+    // to/from the caller or peers (see k_valid_/v_valid_ below).
+    size_t k_pad = static_cast<size_t>(h_kv_) * d_qk_ * 4096;
+    size_t v_pad = static_cast<size_t>(h_kv_) * d_vo_ * 4096;
+    k_elems_ = k_valid_ + k_pad;
+    v_elems_ = v_valid_ + v_pad;
 
     for (int b = 0; b < 2; ++b) {
       k_buf_[b] = sycl::malloc_device<uint16_t>(k_elems_, q_);
@@ -121,10 +136,11 @@ class RingSymmMemory {
 
   // ---- one-time deep copy of this rank's own K/V into compute buffer 0 ----
   // src_k / src_v are device pointers to the caller's (torch) bf16 tensors,
-  // already laid out as packed [rows, h_kv, d].
+  // already laid out as packed [rows, h_kv, d]. Copy only the VALID element
+  // count so we never read past the caller's tensor into padding.
   void load_local_kv(const void* src_k, const void* src_v) {
-    q_.memcpy(k_buf_[0], src_k, k_elems_ * sizeof(uint16_t)).wait();
-    q_.memcpy(v_buf_[0], src_v, v_elems_ * sizeof(uint16_t)).wait();
+    q_.memcpy(k_buf_[0], src_k, k_valid_ * sizeof(uint16_t)).wait();
+    q_.memcpy(v_buf_[0], src_v, v_valid_ * sizeof(uint16_t)).wait();
   }
 
   // ---- accessors used by the host ring driver ----
@@ -149,11 +165,13 @@ class RingSymmMemory {
   // buffer `dst_b`. This is the ring "send" step: a plain packed memcpy over
   // the IPC-mapped remote pointer (no fragment layout, no reorder). The memcpy
   // is issued on the dedicated copy queue so it overlaps the compute queue.
+  // Copy only the VALID element count so we never write past the peer's valid
+  // region into its padding.
   sycl::event push_packed(int dst, int src_b, int dst_b) {
     void* peer_k = remote_k_[dst_b][dst];
     void* peer_v = remote_v_[dst_b][dst];
-    copy_q_.memcpy(peer_k, k_buf_[src_b], k_elems_ * sizeof(uint16_t));
-    return copy_q_.memcpy(peer_v, v_buf_[src_b], v_elems_ * sizeof(uint16_t));
+    copy_q_.memcpy(peer_k, k_buf_[src_b], k_valid_ * sizeof(uint16_t));
+    return copy_q_.memcpy(peer_v, v_buf_[src_b], v_valid_ * sizeof(uint16_t));
   }
 
   // Block until all outstanding copy-queue work (pushes) has completed.
@@ -213,6 +231,9 @@ class RingSymmMemory {
   sycl::queue q_;
   sycl::queue copy_q_;
   size_t k_elems_ = 0, v_elems_ = 0, signal_elems_ = 0;
+  // Valid (payload) element counts, excluding tail padding. Used for all
+  // host<->buffer and buffer<->peer copies.
+  size_t k_valid_ = 0, v_valid_ = 0;
 
   // Number of independent barrier channels supported by the signal pad.
   static constexpr int kNumChannels = 2;

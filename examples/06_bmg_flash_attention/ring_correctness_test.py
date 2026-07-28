@@ -89,7 +89,10 @@ def main():
     # 统一 buffer 语义:load_local_kv 后 buf[0] 始终持有本 rank 自己的 packed K/V。
     # 之后每一轮的 buf[cur] 都是上一轮 peer push 进来的 packed K/V,因此每一轮
     # 都从 buf[cur] 消费(ring_consume=True),不再对 round 0 做特殊处理。
+    print(f"[py rank{rank}] before load_local_kv, "
+          f"k_local.numel={k_local.numel()} v_local.numel={v_local.numel()}", flush=True)
     ring.load_local_kv(k_local.data_ptr(), v_local.data_ptr())
+    print(f"[py rank{rank}] after load_local_kv", flush=True)
     comm.Barrier()
 
     dst = (rank + 1) % world
@@ -97,6 +100,8 @@ def main():
     for t in range(world):
         cur, nxt = t % 2, (t + 1) % 2
         push = (t + 1 < world)
+        print(f"[py rank{rank}] round {t} before call, "
+              f"local_k(cur)={ring.local_k(cur):#x}", flush=True)
 
         # 计算这一轮:Q @ buf[cur] 里的 packed K/V(packed recv 路径)。
         fa.prefill_bf16_ring_round(
