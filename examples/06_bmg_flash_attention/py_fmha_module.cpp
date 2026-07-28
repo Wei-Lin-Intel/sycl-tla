@@ -607,8 +607,7 @@ void prefillBf16RingRound(
     int seqLenQO, int seqLenKV,
     int numHeadsQ, int numHeadsKV,
     int headSizeQK, int headSizeVO,
-    int roundIdx, bool ringEnabled,
-    uintptr_t peerK_ptr, uintptr_t peerV_ptr,
+    int roundIdx,
     bool ringConsume, uintptr_t recvK_ptr, uintptr_t recvV_ptr,
     std::array<int64_t, 3> qS, std::array<int64_t, 3> kS,
     std::array<int64_t, 3> vS, std::array<int64_t, 3> oS,
@@ -625,9 +624,9 @@ void prefillBf16RingRound(
       lse_ptr ? reinterpret_cast<float *>(lse_ptr) : nullptr,
       /*accumulateOutput=*/roundIdx != 0,
       lse_ptr ? lseS.data() : nullptr,
-      /*ringEnabled=*/ringEnabled,
-      reinterpret_cast<void *>(peerK_ptr),
-      reinterpret_cast<void *>(peerV_ptr),
+      /*ringEnabled=*/false,
+      /*ringPeerK=*/nullptr,
+      /*ringPeerV=*/nullptr,
       /*ringConsume=*/ringConsume,
       recvK_ptr ? reinterpret_cast<const void *>(recvK_ptr) : nullptr,
       recvV_ptr ? reinterpret_cast<const void *>(recvV_ptr) : nullptr);
@@ -731,7 +730,14 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
       .def("barrier", [](RingSymmMemory &s, int ch) { s.barrier(ch); })
       .def("push_packed", [](RingSymmMemory &s, int dst, int src_b, int dst_b) {
         s.push_packed(dst, src_b, dst_b).wait();
-      }, py::arg("dst"), py::arg("src_b"), py::arg("dst_b"));
+      }, py::arg("dst"), py::arg("src_b"), py::arg("dst_b"))
+      // Async push: enqueue on the copy queue and return immediately so it can
+      // overlap the attention kernel. Pair with wait_pushes() before the swap.
+      .def("push_packed_async",
+           [](RingSymmMemory &s, int dst, int src_b, int dst_b) {
+             s.push_packed(dst, src_b, dst_b);
+           }, py::arg("dst"), py::arg("src_b"), py::arg("dst_b"))
+      .def("wait_pushes", [](RingSymmMemory &s) { s.wait_pushes(); });
 
   m.def("prefill_bf16_ring_round", &prefillBf16RingRound,
         "One ring-attention round: accumulate Q@current-KV into out/lse and "
@@ -740,9 +746,8 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("lse_ptr"), py::arg("seq_len_qo"), py::arg("seq_len_kv"),
         py::arg("num_heads_q"), py::arg("num_heads_kv"),
         py::arg("head_size_qk"), py::arg("head_size_vo"),
-        py::arg("round_idx"), py::arg("ring_enabled"),
-        py::arg("peer_k_ptr"), py::arg("peer_v_ptr"),
-	py::arg("ring_consume") = false,
+	py::arg("round_idx"),
+        py::arg("ring_consume") = false,
         py::arg("recv_k_ptr") = 0,
         py::arg("recv_v_ptr") = 0,
         py::arg("q_strides"), py::arg("k_strides"), py::arg("v_strides"),

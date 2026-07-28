@@ -53,7 +53,13 @@ class RingSymmMemory {
         d_vo_(d_vo),
         rank_(rank),
         world_size_(world_size),
-        q_(q) {
+	q_(q),
+        // Dedicated copy queue so ring pushes (packed IPC memcpy) can overlap
+        // with the attention kernel running on the compute queue. Binding a
+        // separate in-order queue lets the runtime schedule these memcpys on
+        // a copy engine instead of serializing behind the GEMM.
+        copy_q_(q.get_context(), q.get_device(),
+                sycl::property_list{sycl::property::queue::in_order{}}) {
     // Packed K/V sizing: the recv buffer holds the raw [s_local, h_kv, d]
     // tile, identical to the caller's torch K/V tensor. The kernel loads +
     // reorders it exactly like global memory, so no fragment-layout blow-up.
@@ -71,8 +77,8 @@ class RingSymmMemory {
       q_.memset(v_buf_[b], 0, v_elems_ * sizeof(uint16_t)).wait();
     }
 
-    // Signal pad: world_size uint32 per rank is enough for a barrier.
-    signal_elems_ = static_cast<size_t>(world_size_) * 2;
+    // Signal pad: world_size uint32 per rank per channel.
+    signal_elems_ = static_cast<size_t>(world_size_) * kNumChannels;
     local_signal_ = sycl::malloc_device<uint32_t>(signal_elems_, q_);
     q_.memset(local_signal_, 0, signal_elems_ * sizeof(uint32_t)).wait();
 
@@ -141,16 +147,25 @@ class RingSymmMemory {
 
   // Push this rank's PACKED K/V from local buffer `src_b` into peer `dst`'s
   // buffer `dst_b`. This is the ring "send" step: a plain packed memcpy over
-  // the IPC-mapped remote pointer (no fragment layout, no reorder).
+  // the IPC-mapped remote pointer (no fragment layout, no reorder). The memcpy
+  // is issued on the dedicated copy queue so it overlaps the compute queue.
   sycl::event push_packed(int dst, int src_b, int dst_b) {
     void* peer_k = remote_k_[dst_b][dst];
     void* peer_v = remote_v_[dst_b][dst];
-    q_.memcpy(peer_k, k_buf_[src_b], k_elems_ * sizeof(uint16_t));
-    return q_.memcpy(peer_v, v_buf_[src_b], v_elems_ * sizeof(uint16_t));
+    copy_q_.memcpy(peer_k, k_buf_[src_b], k_elems_ * sizeof(uint16_t));
+    return copy_q_.memcpy(peer_v, v_buf_[src_b], v_elems_ * sizeof(uint16_t));
   }
+
+  // Block until all outstanding copy-queue work (pushes) has completed.
+  void wait_pushes() { copy_q_.wait(); }
 
   // Lightweight inter-round barrier (put/wait on signal pads).
   sycl::event barrier(int channel) {
+    // signal_elems_ only reserves kNumChannels slots per rank; a larger
+    // channel index would index past the allocation and corrupt memory.
+    if (channel < 0 || channel >= kNumChannels) {
+      throw std::runtime_error("RingSymmMemory::barrier channel out of range");
+    }
     int rank = rank_, world = world_size_;
     uint32_t** pads = remote_signal_dev_;
     return q_.submit([&](sycl::handler& h) {
@@ -196,7 +211,11 @@ class RingSymmMemory {
 
   int batch_, seq_kv_local_, h_kv_, d_qk_, d_vo_, rank_, world_size_;
   sycl::queue q_;
+  sycl::queue copy_q_;
   size_t k_elems_ = 0, v_elems_ = 0, signal_elems_ = 0;
+
+  // Number of independent barrier channels supported by the signal pad.
+  static constexpr int kNumChannels = 2;
 
   uint16_t* k_buf_[2] = {nullptr, nullptr};
   uint16_t* v_buf_[2] = {nullptr, nullptr};
