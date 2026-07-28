@@ -360,6 +360,36 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       auto ptr = make_gmem_ptr(base + static_cast<int64_t>(ring_head_idx) * v);
       return make_tensor(ptr, make_layout(V_2D.shape(), V_2D.stride()));
     };
+
+    /* ------ Ring-Attention P2P: hoist recv tensor/copy/partition setup ------
+       These constructions (recv 2D view, TiledCopy, thread slice, partition_S)
+       depend only on loop-invariant quantities (params, ring_head_idx, K/V 2D
+       shape+stride), NOT on the K / D / VV loop indices. Building them here once
+       instead of inside mainloop_body avoids re-constructing them every K-block
+       (and every D / VV iteration). They are cheap layout+pointer computations
+       with no memory access, so building them unconditionally is harmless even
+       when params.ring_consume is false; the actual loads below are still
+       guarded by the ring_consume branch. The per-K index (k_idx) is applied at
+       the copy() call sites, exactly as for the global path. */
+    auto recvK_2D = make_recvK_2D();
+    TiledCopyK copy_k_recv{recvK_2D};
+    auto thr_copy_k_recv = copy_k_recv.get_slice(thr_id);
+    auto gK_recv   = local_tile(make_identity_tensor(recvK_2D.shape()),
+                                TileShapeQK{}, make_coord(_,_,_), Step<X,_1,_1>{});
+    auto tKgK_recv = thr_copy_k_recv.partition_S(gK_recv);
+    auto prefetch_k_recv = make_block_2d_prefetch(copy_k_recv);
+    auto pKgK_recv = prefetch_k_recv.get_slice(thr_id).partition_S(gK_recv);
+
+    auto recvV_2D = make_recvV_2D();
+    TiledCopyV copy_v_recv{recvV_2D};
+    auto thr_copy_v_recv = copy_v_recv.get_slice(thr_id);
+    auto gV_recv       = local_tile(make_identity_tensor(recvV_2D.shape()),
+                                    tile_shape_v, make_coord(get<1>(blk_qv),_));
+    auto gV_recv_split = local_tile(gV_recv, TileShapePV{}, make_coord(_,_,0), Step<X,_1,_1>{});
+    auto tVgV_recv     = thr_copy_v_recv.partition_S(gV_recv_split);
+    auto prefetch_v_recv = make_block_2d_prefetch(copy_v_recv);
+    auto pVgV_recv = prefetch_v_recv.get_slice(thr_id).partition_S(gV_recv_split);
+
     // ------
     // Kernel
     // ------
@@ -438,35 +468,36 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
           if (params.ring_consume) {
 	    // Round 1..N-1: load K from the PACKED recv buffer, then reorder
             // exactly like the global path. Bit-identical to a plain load.
-            auto recvK_2D = make_recvK_2D();
-            TiledCopyK copy_k_recv{recvK_2D};
-            auto thr_copy_k_recv = copy_k_recv.get_slice(thr_id);
-            auto gK_recv   = local_tile(make_identity_tensor(recvK_2D.shape()),
-                                        TileShapeQK{}, make_coord(_,_,_), Step<X,_1,_1>{});
-            auto tKgK_recv = thr_copy_k_recv.partition_S(gK_recv);
+            // (recv tensor/copy/partition are hoisted above the loop.)
             copy(copy_k_recv, tKgK_recv(_,_,_,k_idx,D), tKrK);
-            reorder(tKrK, tSrK);
           } else {
             copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
-            reorder(tKrK, tSrK);
           }
         } else {
           copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
-          reorder(tKrK, tSrK);
         }
+	reorder(tKrK, tSrK);
 
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
       /* V prefetch for GEMM 2 */
-      // Skip the global V prefetch on the non-cache ring-consume path: V for
-      // this round comes from the peer recv buffer, not global memory.
-      if (!(!is_cache && params.ring_consume)) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
+      // V for this round comes from the peer recv buffer on the non-cache
+      // ring-consume path, from global V otherwise. Both are global memory
+      // and must be prefetched.
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        if constexpr (!is_cache) {
+          if (params.ring_consume) {
+            prefetch(prefetch_v_recv, pVgV_recv(_,_,_,VV,k_idx));
+          } else {
+            prefetch(prefetch_v_cur, pVgV_cur(_,_,_,VV,k_idx));
+          }
+        } else {
           prefetch(prefetch_v_cur, pVgV_cur(_,_,_,VV,k_idx));
         }
       }
+
       /* Causal masking - only in non-cache mode */
       if constexpr (!is_cache && CausalMask) {
         if (K == total_blk - 1) {
@@ -512,23 +543,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
         if constexpr (!is_cache) {
           if (params.ring_consume) {
 	    // Round 1..N-1: load V from the PACKED recv buffer + reorder.
-            auto recvV_2D = make_recvV_2D();
-            TiledCopyV copy_v_recv{recvV_2D};
-            auto thr_copy_v_recv = copy_v_recv.get_slice(thr_id);
-            auto gV_recv       = local_tile(make_identity_tensor(recvV_2D.shape()),
-                                            tile_shape_v, make_coord(get<1>(blk_qv),_));
-            auto gV_recv_split = local_tile(gV_recv, TileShapePV{}, make_coord(_,_,0), Step<X,_1,_1>{});
-            auto tVgV_recv     = thr_copy_v_recv.partition_S(gV_recv_split);
+            // (recv tensor/copy/partition are hoisted above the loop.)
             copy(copy_v_recv, tVgV_recv(_,_,_,VV,k_idx), tVrV);
-            reorder(tVrV, tArV);
           } else {
             copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
-            reorder(tVrV, tArV);
           }
         } else {
           copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
-          reorder(tVrV, tArV);
         }
+	reorder(tVrV, tArV);
 
         if (K != blk_k0) {
           CUTLASS_PRAGMA_UNROLL
@@ -553,12 +576,18 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
           if (is_cache_next) {
             prefetch(prefetch_k_cache, pKgK_cache(_,_,_,physical_K_next,D));
           } else {
-	    if (!params.ring_consume) {
+            // Next tile is non-cache (ring): prefetch recv buffer when
+            // consuming, otherwise global K.
+            if (params.ring_consume) {
+              prefetch(prefetch_k_recv, pKgK_recv(_,_,_,K_next-kblocks_cache,D));
+            } else {
               prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
             }
           }
         } else {
-	  if (!params.ring_consume) {
+          if (params.ring_consume) {
+            prefetch(prefetch_k_recv, pKgK_recv(_,_,_,K_next-kblocks_cache,D));
+          } else {
             prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
           }
         }

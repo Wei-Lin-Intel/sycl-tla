@@ -140,9 +140,9 @@ def main():
         ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=False).transpose(1, 2).contiguous()
     torch.xpu.synchronize()
 
-    print(out)
-    print()
-    print(ref)
+#    print(out)
+#    print()
+#    print(ref)
 
     # 用 cosine similarity 判定:把每个 (batch, head, query) 的 head-dim 向量
     # 当作一条向量,沿 head-dim(最后一维)算 cos 相似度。这样对 bf16 的幅度
