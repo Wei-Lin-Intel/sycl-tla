@@ -861,15 +861,9 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
         options.use_paged_kv ? paged_kv_cache.page_table.get() : nullptr,
         options.use_paged_kv ? paged_kv_cache.page_size : 0,
         options.use_paged_kv ? paged_kv_cache.num_pages_per_seq.get() : nullptr,
-        options.ring_enabled,
-        options.ring_peer_k,
-        options.ring_peer_v,
         options.ring_consume,
         options.ring_recv_k,
         options.ring_recv_v,
-        options.ring_selftest,
-        options.ring_selftest ? static_cast<void*>(ring_self_k_buf.get()) : nullptr,
-        options.ring_selftest ? static_cast<void*>(ring_self_v_buf.get()) : nullptr
       },
       {
         options.external_lse,

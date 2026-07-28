@@ -142,22 +142,16 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
   using ElementA = typename TiledMMAPV::ValTypeD;
 
-  // ---- Ring-Attention P2P: fragment-level push/pull ----
-  // Both tSrK (Q*K MMA-B) and tArV (P*V MMA-B) are, per work-item, exactly
-  // 64 contiguous elements of the same value type (validated: they coalesce
-  // to a _64:_1 layout). This lets us push/pull them as raw bits, with the
-  // *identical* format on both ends since every rank runs the same
-  // TiledMMAQK/TiledMMAPV.
+  // ---- Ring-Attention P2P (packed K/V) ----
+  // The ring recv buffer holds PACKED K/V (identical layout to the global
+  // K/V tile this kernel already consumes), NOT MMA-B fragments. On the
+  // consume round we simply point the normal block-2D load+reorder path at
+  // the recv buffer instead of global memory. This keeps the peer buffer at
+  // packed size (s_local*h_kv*d) and reuses the proven reorder path, so the
+  // result is bit-identical to a plain load.
   using RingValType = typename TiledMMAQK::ValTypeB;
   static_assert(cute::is_same_v<RingValType, typename TiledMMAPV::ValTypeB>,
                 "Ring P2P requires identical K/V MMA-B element types");
-  // Total work-items participating in the Q*K tile (== P*V tile, same WG).
-  static constexpr int NumThreadsQK = size(TiledMMAQK{});
-
-  // Number of head-dim (D) sub-tiles of the Q*K MMA-B fragment. Each D
-  // sub-tile is an independent 64-element fragment, so the K peer slot must
-  // be indexed by (k_tile, D). V has no D loop (it is split over VV instead).
-  static constexpr int NumDTilesQK = size<3>(typename TiledMMAQK::AtomLayoutC_TV{}); // placeholder, see NOTE
 
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool CachedKV = CachedKV_;
@@ -169,25 +163,16 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int const* num_pages_per_seq = nullptr;
-    // ---- Ring-Attention P2P (batch == 1, non-causal) ----
-    // Send side: push the *post-reorder* MMA-B fragments (tSrK / tArV) to the
-    // next rank's receive buffer via a raw UniversalCopy (no block-2D atom,
-    // no transpose/VNNI restore). Layout: see slot_K()/slot_V() below.
-    bool ring_enabled = false;
-    void* peer_k_next = nullptr;   // next rank's K recv buffer (flat, MMA-B layout)
-    void* peer_v_next = nullptr;   // next rank's V recv buffer (flat, MMA-B layout)
-
-    // Receive side (rounds 2..N): when ring_consume is set, K/V for THIS
-    // round are read directly from this rank's own receive buffer (already
-    // in MMA-B fragment layout, written by the previous round's peer push)
-    // instead of being loaded+reordered from global memory. This applies to
-    // the non-cache K/V path only.
+    // ---- Ring-Attention P2P (packed K/V, batch == 1, non-causal) ----
+    // Consume side (rounds 1..N-1): when ring_consume is set, K/V for THIS
+    // round are read from this rank's own recv buffer, which holds PACKED
+    // K/V written by the previous round's peer push (a plain packed memcpy on
+    // the host side). The kernel loads + reorders it exactly like global K/V.
+    // Push is done host-side (packed IPC memcpy), so no send-side kernel work
+    // is needed here anymore.
     bool ring_consume = false;
-    void const* ring_recv_k = nullptr; // this rank's local K recv buffer
-    void const* ring_recv_v = nullptr; // this rank's local V recv buffer
-    bool ring_selftest = false;
-    void* ring_self_k = nullptr;
-    void* ring_self_v = nullptr;
+    void const* ring_recv_k = nullptr; // packed [s_local, h_kv, d_qk] bf16
+    void const* ring_recv_v = nullptr; // packed [s_local, h_kv, d_vo] bf16
   };
 
   // Kernel-facing parameters
@@ -209,9 +194,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     constexpr double kLog2e = 1.4426950408889634074;            // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq,
-                  args.ring_enabled, args.peer_k_next, args.peer_v_next,
-                  args.ring_consume, args.ring_recv_k, args.ring_recv_v,
-		  args.ring_selftest, args.ring_self_k, args.ring_self_v};
+                  args.ring_consume, args.ring_recv_k, args.ring_recv_v};
   }
 
   CUTLASS_HOST_DEVICE static
@@ -340,52 +323,32 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
     auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
 
-    /* ------ Ring-Attention P2P: flat peer buffers (MMA-B fragment layout) ------
-       Peer K buffer slot: k_idx * NumThreadsQK + thr_id, 64 RingValType elems.
-       Peer V buffer slot: (k_idx * VTiles + VV) * NumThreadsQK + thr_id, 64 elems.
-       Same formula used by both the sender (this round) and the receiver
-       (next round, via ring_consume), so the format never drifts. */
-    RingValType* peerKBuf = reinterpret_cast<RingValType*>(params.peer_k_next);
-    RingValType* peerVBuf = reinterpret_cast<RingValType*>(params.peer_v_next);
-    RingValType const* recvKBuf = reinterpret_cast<RingValType const*>(params.ring_recv_k);
-    RingValType const* recvVBuf = reinterpret_cast<RingValType const*>(params.ring_recv_v);
-    RingValType* selfKBuf = reinterpret_cast<RingValType*>(params.ring_self_k);
-    RingValType* selfVBuf = reinterpret_cast<RingValType*>(params.ring_self_v);
+    /* ------ Ring-Attention P2P: PACKED recv buffers ------
+       On the consume round, K/V come from params.ring_recv_k / ring_recv_v,
+       which are packed [k, d] (K) and [d, k] (V) tiles for THIS (batch,head),
+       laid out identically to the global K_2D / V_2D this kernel normally
+       loads. We build 2D tensors over the recv buffers and reuse the same
+       TiledCopyK / TiledCopyV + reorder path -> bit-identical to a plain load.
 
-    /*
-    auto push_ring_frag = [&](auto& frag, RingValType* peer_base, int slot) {
-      // frag coalesces to (_64:_1): reinterpret it as a flat 64-elem rmem
-      // tensor referencing the same underlying array (no copy, no reorder).
-      Tensor frag_flat = make_tensor(frag.data(), Layout<Shape<Int<RingFragElems>>>{});
-      Tensor peer_t = make_tensor(make_gmem_ptr(peer_base + slot * RingFragElems),
-                                   Layout<Shape<Int<RingFragElems>>>{});
-      copy(RingCopyAtom{}, frag_flat, peer_t);
+       Row strides:
+         K recv: shape (k, d), stride (d_qk, 1)
+         V recv: shape (d, k), stride (1, d_vo)   (V is stored [d, k] = "vnni-
+                 friendly" packed, matching V_2D's (v,k) coordinate tensor).
+       The recv buffer for one (batch,head) is contiguous with row stride
+       ring_recv_{k,v}_row_stride (== d_qk / d_vo for the packed per-head tile). */
+    using RingElemK = typename TensorK2D::element_type;
+    using RingElemV = typename TensorV2D::element_type;
+
+    auto make_recvK_2D = [&]() {
+      auto ptr = make_gmem_ptr(reinterpret_cast<RingElemK const*>(params.ring_recv_k));
+      // Same logical shape/stride as K_2D: (k, d) with stride (d, 1).
+      return make_tensor(ptr, make_layout(K_2D.shape(), K_2D.stride()));
     };
-
-    auto pull_ring_frag = [&](auto& frag, RingValType const* peer_base, int slot) {
-      Tensor peer_t = make_tensor(make_gmem_ptr(peer_base + slot * RingFragElems),
-                                   Layout<Shape<Int<RingFragElems>>>{});
-      Tensor frag_flat = make_tensor(frag.data(), Layout<Shape<Int<RingFragElems>>>{});
-      copy(RingCopyAtom{}, peer_t, frag_flat);
+    auto make_recvV_2D = [&]() {
+      auto ptr = make_gmem_ptr(reinterpret_cast<RingElemV const*>(params.ring_recv_v));
+      // Same logical shape/stride as V_2D: (v, k).
+      return make_tensor(ptr, make_layout(V_2D.shape(), V_2D.stride()));
     };
-    */
-
-    auto push_ring_frag = [&](auto& frag, RingValType* peer_base, int slot) {
-      using FragT = remove_cvref_t<decltype(frag)>;
-      constexpr int N = cute::size(typename FragT::layout_type{});
-      RingValType* dst = peer_base + slot * N;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < N; ++i) dst[i] = frag(i);
-    };
-
-    auto pull_ring_frag = [&](auto& frag, RingValType const* peer_base, int slot) {
-      using FragT = remove_cvref_t<decltype(frag)>;
-      constexpr int N = cute::size(typename FragT::layout_type{});
-      RingValType const* src = peer_base + slot * N;
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < N; ++i) frag(i) = src[i];
-    };
-
     // ------
     // Kernel
     // ------
@@ -402,9 +365,6 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
        ring_head : head index for this WG (ring scope is batch==1, so l_coord
                    enumerates heads only).
        kTilesRing : # of non-cache (ring) K tiles. */
-    int const nD_qk      = size<4>(tKgK);
-    int const ring_head  = ring_head_idx;
-    int const kTilesRing = total_blk - kblocks_cache;
 
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_,_,_,D));
@@ -465,28 +425,19 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
 
         if constexpr (!is_cache) {
           if (params.ring_consume) {
-            // Round 2..N: pull the peer-pushed MMA-B fragment straight into
-            // tSrK. No global load, no transpose/VNNI, no reorder needed.
-	    pull_ring_frag(tSrK, recvKBuf,
-                (((ring_head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK) + thr_id);
+	    // Round 1..N-1: load K from the PACKED recv buffer, then reorder
+            // exactly like the global path. Bit-identical to a plain load.
+            auto recvK_2D = make_recvK_2D();
+            TiledCopyK copy_k_recv{recvK_2D};
+            auto thr_copy_k_recv = copy_k_recv.get_slice(thr_id);
+            auto gK_recv   = local_tile(make_identity_tensor(recvK_2D.shape()),
+                                        TileShapeQK{}, make_coord(_,_,_), Step<X,_1,_1>{});
+            auto tKgK_recv = thr_copy_k_recv.partition_S(gK_recv);
+            copy(copy_k_recv, tKgK_recv(_,_,_,k_idx,D), tKrK);
+            reorder(tKrK, tSrK);
           } else {
             copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
             reorder(tKrK, tSrK);
-            /* Ring P2P: push this K tile's post-reorder MMA-B fragment to
-               the next rank. Reuses tSrK as-is; no extra reorder/registers.
-               No dependency with the cute::gemm below, so it overlaps. */
-            if (params.ring_enabled) {
-	      push_ring_frag(tSrK, peerKBuf,
-                  (((ring_head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK) + thr_id);
-            }
-	    // Self-loopback (world_size==1): push tSrK to a LOCAL buffer,
-            // then pull it straight back into tSrK before the GEMM. Result
-            // must be bit-identical to the plain reorder path.
-            if (params.ring_selftest) {
-              int slot = (((ring_head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK) + thr_id;
-              push_ring_frag(tSrK, selfKBuf, slot);
-              pull_ring_frag(tSrK, selfKBuf, slot);
-            }
           }
         } else {
           copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
@@ -549,22 +500,19 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       for (int VV = 0; VV < VTiles; VV++) {
         if constexpr (!is_cache) {
           if (params.ring_consume) {
-            // Round 2..N: pull the peer-pushed MMA-B fragment for this VV.
-	    pull_ring_frag(tArV, recvVBuf,
-                (((ring_head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK) + thr_id);
+	    // Round 1..N-1: load V from the PACKED recv buffer + reorder.
+            auto recvV_2D = make_recvV_2D();
+            TiledCopyV copy_v_recv{recvV_2D};
+            auto thr_copy_v_recv = copy_v_recv.get_slice(thr_id);
+            auto gV_recv       = local_tile(make_identity_tensor(recvV_2D.shape()),
+                                            tile_shape_v, make_coord(get<1>(blk_qv),_));
+            auto gV_recv_split = local_tile(gV_recv, TileShapePV{}, make_coord(_,_,0), Step<X,_1,_1>{});
+            auto tVgV_recv     = thr_copy_v_recv.partition_S(gV_recv_split);
+            copy(copy_v_recv, tVgV_recv(_,_,_,VV,k_idx), tVrV);
+            reorder(tVrV, tArV);
           } else {
             copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
             reorder(tVrV, tArV);
-            /* Ring P2P: push this V tile's post-reorder MMA-B fragment. */
-            if (params.ring_enabled) {
-	      push_ring_frag(tArV, peerVBuf,
-                  (((ring_head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK) + thr_id);
-            }
-	    if (params.ring_selftest) {
-              int slot = (((ring_head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK) + thr_id;
-              push_ring_frag(tArV, selfVBuf, slot);
-              pull_ring_frag(tArV, selfVBuf, slot);
-            }
           }
         } else {
           copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);

@@ -54,18 +54,12 @@ class RingSymmMemory {
         rank_(rank),
         world_size_(world_size),
         q_(q) {
-    if (tile_k > 0 && nd_qk > 0 && vtiles > 0 && threads > 0 && frag > 0) {
-      // Fragment-layout sizing: must match the mainloop slot formula
-      //   K slot = ((head * kTiles + k_idx) * nd_qk + D) * threads + thr
-      //   V slot = ((head * kTiles + k_idx) * vtiles + VV) * threads + thr
-      size_t k_tiles = static_cast<size_t>((seq_kv_local_ + tile_k - 1) / tile_k);
-      size_t heads   = static_cast<size_t>(h_kv_);
-      k_elems_ = heads * k_tiles * nd_qk  * threads * frag;
-      v_elems_ = heads * k_tiles * vtiles * threads * frag;
-    } else {
-      k_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_qk_;
-      v_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_vo_;
-    }
+    // Packed K/V sizing: the recv buffer holds the raw [s_local, h_kv, d]
+    // tile, identical to the caller's torch K/V tensor. The kernel loads +
+    // reorders it exactly like global memory, so no fragment-layout blow-up.
+    (void)tile_k; (void)nd_qk; (void)vtiles; (void)threads; (void)frag;
+    k_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_qk_;
+    v_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_vo_;
 
     for (int b = 0; b < 2; ++b) {
       k_buf_[b] = sycl::malloc_device<uint16_t>(k_elems_, q_);
@@ -144,6 +138,16 @@ class RingSymmMemory {
   int seq_kv_local() const { return seq_kv_local_; }
   int k_row_stride() const { return h_kv_ * d_qk_; }  // packed row stride (elems)
   int v_row_stride() const { return h_kv_ * d_vo_; }
+
+  // Push this rank's PACKED K/V from local buffer `src_b` into peer `dst`'s
+  // buffer `dst_b`. This is the ring "send" step: a plain packed memcpy over
+  // the IPC-mapped remote pointer (no fragment layout, no reorder).
+  sycl::event push_packed(int dst, int src_b, int dst_b) {
+    void* peer_k = remote_k_[dst_b][dst];
+    void* peer_v = remote_v_[dst_b][dst];
+    q_.memcpy(peer_k, k_buf_[src_b], k_elems_ * sizeof(uint16_t));
+    return q_.memcpy(peer_v, v_buf_[src_b], v_elems_ * sizeof(uint16_t));
+  }
 
   // Lightweight inter-round barrier (put/wait on signal pads).
   sycl::event barrier(int channel) {
