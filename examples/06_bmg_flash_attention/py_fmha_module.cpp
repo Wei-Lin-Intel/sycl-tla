@@ -92,8 +92,6 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
                     bool ringEnabled = false,
                     void *ringPeerK = nullptr,
                     void *ringPeerV = nullptr,
-                    int ringPeerKLd = 0,
-		    int ringPeerVLd = 0,
                     bool ringConsume = false,
                     const void *ringRecvK = nullptr,
                     const void *ringRecvV = nullptr) {
@@ -140,8 +138,6 @@ int prefillBf16Impl(int batch, int numHeadsQ, int numHeadsKV, int seqLenQO,
   options.ring_enabled   = ringEnabled;
   options.ring_peer_k    = ringPeerK;
   options.ring_peer_v    = ringPeerV;
-  options.ring_peer_k_ld = ringPeerKLd;
-  options.ring_peer_v_ld = ringPeerVLd;
   options.ring_consume   = ringConsume;
   options.ring_recv_k    = ringRecvK;
   options.ring_recv_v    = ringRecvV;
@@ -608,7 +604,7 @@ void prefillBf16RingRound(
     int numHeadsQ, int numHeadsKV,
     int headSizeQK, int headSizeVO,
     int roundIdx, bool ringEnabled,
-    int64_t peerK_ptr, int64_t peerV_ptr, int peerKLd, int peerVLd,
+    int64_t peerK_ptr, int64_t peerV_ptr,
     bool ringConsume, int64_t recvK_ptr, int64_t recvV_ptr,
     std::array<int64_t, 3> qS, std::array<int64_t, 3> kS,
     std::array<int64_t, 3> vS, std::array<int64_t, 3> oS,
@@ -628,7 +624,6 @@ void prefillBf16RingRound(
       /*ringEnabled=*/ringEnabled,
       reinterpret_cast<void *>(peerK_ptr),
       reinterpret_cast<void *>(peerV_ptr),
-      peerKLd, peerVLd,
       /*ringConsume=*/ringConsume,
       recvK_ptr ? reinterpret_cast<const void *>(recvK_ptr) : nullptr,
       recvV_ptr ? reinterpret_cast<const void *>(recvV_ptr) : nullptr);
@@ -713,7 +708,6 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("head_size_qk"), py::arg("head_size_vo"),
         py::arg("round_idx"), py::arg("ring_enabled"),
         py::arg("peer_k_ptr"), py::arg("peer_v_ptr"),
-        py::arg("peer_k_ld"), py::arg("peer_v_ld"),
 	py::arg("ring_consume") = false,
         py::arg("recv_k_ptr") = 0,
         py::arg("recv_v_ptr") = 0,

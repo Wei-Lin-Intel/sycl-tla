@@ -157,6 +157,11 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   // Total work-items participating in the Q*K tile (== P*V tile, same WG).
   static constexpr int NumThreadsQK = size(TiledMMAQK{});
 
+  // Number of head-dim (D) sub-tiles of the Q*K MMA-B fragment. Each D
+  // sub-tile is an independent 64-element fragment, so the K peer slot must
+  // be indexed by (k_tile, D). V has no D loop (it is split over VV instead).
+  static constexpr int NumDTilesQK = size<3>(typename TiledMMAQK::AtomLayoutC_TV{}); // placeholder, see NOTE
+
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool CachedKV = CachedKV_;
   static constexpr bool PagedKV = PagedKV_;
@@ -184,9 +189,6 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     void const* ring_recv_k = nullptr; // this rank's local K recv buffer
     void const* ring_recv_v = nullptr; // this rank's local V recv buffer
   };
-
-  // Kernel-facing parameters
-  using Params = Arguments;
 
   // Kernel-facing parameters
   using Params = Arguments;
@@ -369,6 +371,19 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
+
+    /* Ring-Attention P2P fragment-slot descriptors. Kept identical on the
+       push (send) and pull (receive) sides so the flat layout never drifts.
+         K slot = ((head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK + thr
+         V slot = ((head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK + thr
+       nD_qk : # of head-dim (D) sub-tiles of the Q*K MMA-B fragment.
+       ring_head : head index for this WG (ring scope is batch==1, so l_coord
+                   enumerates heads only).
+       kTilesRing : # of non-cache (ring) K tiles. */
+    int const nD_qk      = size<4>(tKgK);
+    int const ring_head  = l_coord;
+    int const kTilesRing = total_blk - kblocks_cache;
+
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_,_,_,D));
     }
@@ -383,7 +398,11 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
             prefetch(prefetch_k_cache, pKgK_cache(_,_,_,K,D));
           }
         } else {
-          prefetch(prefetch_k, pKgK(_,_,_,K - kblocks_cache,D));
+	  // Non-cache (ring) K: skip global prefetch when consuming from the
+          // peer recv buffer (that memory is not read this round).
+          if (!params.ring_consume) {
+            prefetch(prefetch_k, pKgK(_,_,_,K - kblocks_cache,D));
+          }
         }
       }
     }
@@ -426,7 +445,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
           if (params.ring_consume) {
             // Round 2..N: pull the peer-pushed MMA-B fragment straight into
             // tSrK. No global load, no transpose/VNNI, no reorder needed.
-            pull_ring_frag(tSrK, recvKBuf, k_idx * NumThreadsQK + thr_id);
+	    pull_ring_frag(tSrK, recvKBuf,
+                (((ring_head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK) + thr_id);
           } else {
             copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
             reorder(tKrK, tSrK);
@@ -434,7 +454,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
                the next rank. Reuses tSrK as-is; no extra reorder/registers.
                No dependency with the cute::gemm below, so it overlaps. */
             if (params.ring_enabled) {
-              push_ring_frag(tSrK, peerKBuf, k_idx * NumThreadsQK + thr_id);
+	      push_ring_frag(tSrK, peerKBuf,
+                  (((ring_head * kTilesRing + k_idx) * nD_qk + D) * NumThreadsQK) + thr_id);
             }
           }
         } else {
@@ -446,9 +467,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       }
 
       /* V prefetch for GEMM 2 */
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cur, pVgV_cur(_,_,_,VV,k_idx));
+      // Skip the global V prefetch on the non-cache ring-consume path: V for
+      // this round comes from the peer recv buffer, not global memory.
+      if (!(!is_cache && params.ring_consume)) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v_cur, pVgV_cur(_,_,_,VV,k_idx));
+        }
       }
       /* Causal masking - only in non-cache mode */
       if constexpr (!is_cache && CausalMask) {
@@ -495,13 +520,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
         if constexpr (!is_cache) {
           if (params.ring_consume) {
             // Round 2..N: pull the peer-pushed MMA-B fragment for this VV.
-            pull_ring_frag(tArV, recvVBuf, (k_idx * VTiles + VV) * NumThreadsQK + thr_id);
+	    pull_ring_frag(tArV, recvVBuf,
+                (((ring_head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK) + thr_id);
           } else {
             copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
             reorder(tVrV, tArV);
             /* Ring P2P: push this V tile's post-reorder MMA-B fragment. */
             if (params.ring_enabled) {
-              push_ring_frag(tArV, peerVBuf, (k_idx * VTiles + VV) * NumThreadsQK + thr_id);
+	      push_ring_frag(tArV, peerVBuf,
+                  (((ring_head * kTilesRing + k_idx) * VTiles + VV) * NumThreadsQK) + thr_id);
             }
           }
         } else {
@@ -532,10 +559,14 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
           if (is_cache_next) {
             prefetch(prefetch_k_cache, pKgK_cache(_,_,_,physical_K_next,D));
           } else {
-            prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
+	    if (!params.ring_consume) {
+              prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
+            }
           }
         } else {
-          prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
+	  if (!params.ring_consume) {
+            prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
+          }
         }
       }
       barrier_wait(ScopeWorkgroup);

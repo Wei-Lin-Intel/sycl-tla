@@ -36,7 +36,16 @@ class RingSymmMemory {
                  int d_vo,
                  int rank,
                  int world_size,
-                 sycl::queue& q)
+		 sycl::queue& q,
+                 // Ring P2P fragment-layout descriptors (from the FMHA kernel):
+                 //   tile_k    = Q*K K-tile length
+                 //   nd_qk     = # of D sub-tiles of the Q*K MMA-B fragment
+                 //   vtiles    = VTiles
+                 //   threads   = NumThreadsQK (== size(TiledMMAQK))
+                 //   frag      = RingFragElems (64)
+                 // When any is 0, fall back to the packed-KV sizing (legacy).
+                 int tile_k = 0, int nd_qk = 0, int vtiles = 0,
+                 int threads = 0, int frag = 0)
       : batch_(batch),
         seq_kv_local_(seq_kv_local),
         h_kv_(h_kv),
@@ -45,8 +54,18 @@ class RingSymmMemory {
         rank_(rank),
         world_size_(world_size),
         q_(q) {
-    k_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_qk_;
-    v_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_vo_;
+    if (tile_k > 0 && nd_qk > 0 && vtiles > 0 && threads > 0 && frag > 0) {
+      // Fragment-layout sizing: must match the mainloop slot formula
+      //   K slot = ((head * kTiles + k_idx) * nd_qk + D) * threads + thr
+      //   V slot = ((head * kTiles + k_idx) * vtiles + VV) * threads + thr
+      size_t k_tiles = static_cast<size_t>((seq_kv_local_ + tile_k - 1) / tile_k);
+      size_t heads   = static_cast<size_t>(h_kv_);
+      k_elems_ = heads * k_tiles * nd_qk  * threads * frag;
+      v_elems_ = heads * k_tiles * vtiles * threads * frag;
+    } else {
+      k_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_qk_;
+      v_elems_ = static_cast<size_t>(batch_) * seq_kv_local_ * h_kv_ * d_vo_;
+    }
 
     for (int b = 0; b < 2; ++b) {
       k_buf_[b] = sycl::malloc_device<uint16_t>(k_elems_, q_);

@@ -84,8 +84,6 @@ struct Options {
   bool ring_enabled = false;
   void* ring_peer_k = nullptr;   // raw device ptr: next rank's K recv buffer
   void* ring_peer_v = nullptr;   // raw device ptr: next rank's V recv buffer
-  int   ring_peer_k_ld = 0;      // row stride (elems) of peer K buffer = Hkv*Dqk
-  int   ring_peer_v_ld = 0;      // row stride (elems) of peer V buffer = Hkv*Dvo
   bool ring_consume = false;
   void const* ring_recv_k = nullptr;
   void const* ring_recv_v = nullptr;

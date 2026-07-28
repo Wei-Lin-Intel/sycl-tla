@@ -79,7 +79,6 @@ def main():
 
     qS, oS, lseS = bshd_strides(q), bshd_strides(out), lse_strides(lse)
     kS, vS = bshd_strides(k_local), bshd_strides(v_local)
-    peer_k_ld, peer_v_ld = Hkv * Dqk, Hkv * Dvo
 
     def run_ring_once():
         #out = torch.empty(1, s_local, Hq, Dvo, device=device, dtype=dtype)
@@ -109,7 +108,6 @@ def main():
                 round_idx=t, ring_enabled=enabled,
                 peer_k_ptr=ring.remote_k(dst, nxt) if enabled else 0,
                 peer_v_ptr=ring.remote_v(dst, nxt) if enabled else 0,
-                peer_k_ld=peer_k_ld, peer_v_ld=peer_v_ld,
                 ring_consume=consume,
                 recv_k_ptr=ring.local_k(cur) if consume else 0,
                 recv_v_ptr=ring.local_v(cur) if consume else 0,
