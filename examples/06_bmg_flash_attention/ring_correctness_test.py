@@ -46,32 +46,29 @@ def main():
     assert Hq % Hkv == 0 and Dqk % 32 == 0
     assert s_local % 32 == 0, "s_local 必须是 TileK(32) 的倍数"
 
-    # 所有 rank 用同一份全局数据(CPU 生成 + 广播,保证 bit 一致)
-    torch.manual_seed(a.seed)
-    if rank == 0:
-        q_full = torch.randn(1, S_global, Hq,  Dqk, dtype=torch.float32)
-        k_full = torch.randn(1, S_global, Hkv, Dqk, dtype=torch.float32)
-        v_full = torch.randn(1, S_global, Hkv, Dvo, dtype=torch.float32)
-    else:
-        q_full = torch.empty(1, S_global, Hq,  Dqk, dtype=torch.float32)
-        k_full = torch.empty(1, S_global, Hkv, Dqk, dtype=torch.float32)
-        v_full = torch.empty(1, S_global, Hkv, Dvo, dtype=torch.float32)
+    # 每个 rank 用不同 seed 生成自己的 local shard(randn),再通过 Allgather
+    # 拼成 full 张量给后面的 PyTorch SDPA 做 verify。
+    torch.manual_seed(a.seed + rank)
+    q_local_f = torch.randn(1, s_local, Hq,  Dqk, dtype=torch.float32)
+    k_local_f = torch.randn(1, s_local, Hkv, Dqk, dtype=torch.float32)
+    v_local_f = torch.randn(1, s_local, Hkv, Dvo, dtype=torch.float32)
 
-    def bcast(t):
-        arr = np.ascontiguousarray(t.numpy())
-        comm.Bcast(arr, root=0)
-        return torch.from_numpy(arr).to(dt).to(dev)
+    def allgather_full(t_local, H, D):
+        # t_local: (1, s_local, H, D) float32 on CPU
+        send = np.ascontiguousarray(t_local.numpy())
+        recv = np.empty((world,) + send.shape, dtype=np.float32)
+        comm.Allgather(send, recv)
+        # recv: (world, 1, s_local, H, D) -> (1, world*s_local, H, D)
+        full = torch.from_numpy(recv).permute(1, 0, 2, 3, 4).reshape(1, S_global, H, D)
+        return full.contiguous()
 
-    q_full = bcast(q_full)
-    k_full = bcast(k_full)
-    v_full = bcast(v_full)
+    q_full = allgather_full(q_local_f, Hq,  Dqk).to(dt).to(dev)
+    k_full = allgather_full(k_local_f, Hkv, Dqk).to(dt).to(dev)
+    v_full = allgather_full(v_local_f, Hkv, Dvo).to(dt).to(dev)
 
-    def shard(t):
-        return t[:, rank * s_local:(rank + 1) * s_local].contiguous()
-
-    q       = shard(q_full)
-    k_local = shard(k_full)
-    v_local = shard(v_full)
+    q       = q_full[:, rank * s_local:(rank + 1) * s_local].contiguous()
+    k_local = k_full[:, rank * s_local:(rank + 1) * s_local].contiguous()
+    v_local = v_full[:, rank * s_local:(rank + 1) * s_local].contiguous()
 
     qS = bshd_strides(q)
     kS = bshd_strides(k_local)
