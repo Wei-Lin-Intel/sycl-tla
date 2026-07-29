@@ -556,6 +556,106 @@ py::object prefillBf16TensorBSHDKVList(
       return py::cast(out);
 }
 
+// One ring-attention KV round for the BSHD K/V-list path.
+//
+// Attends the local Q shard against a single KV block (contiguous [B,S,H,D]),
+// accumulating into caller-owned out (BF16) + lse (FP32) via the online-softmax
+// LSE-merge epilogue. This is exactly one iteration of the loop inside
+// prefill_bf16_bshd_kv_list, but exposed so the Python ring driver can feed one
+// peer KV block per round and overlap the P2P transfer of the *next* block.
+//
+//   round_idx == 0 : first block, initialize out/lse (accumulate_output = false)
+//   round_idx  > 0 : subsequent blocks, LSE-merge into out/lse
+//
+// out and lse MUST be preallocated by the caller and reused across all rounds:
+//   out : [B, Sq, Hq, Dvo] bf16, contiguous
+//   lse : [B, Hq, Sq]      f32, contiguous
+void prefillBf16TensorBSHDKVRound(
+      const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+      at::Tensor &out, at::Tensor &lse, int64_t roundIdx) {
+      TORCH_CHECK(q.device().type() == c10::DeviceType::XPU,
+                  "q must be an XPU tensor");
+      TORCH_CHECK(q.scalar_type() == at::kBFloat16 &&
+                        k.scalar_type() == at::kBFloat16 &&
+                        v.scalar_type() == at::kBFloat16,
+                  "q, k, v must have bfloat16 dtype");
+      TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                  "q, k, v must be rank-4 BSHD tensors");
+      TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                  "q, k, v must be contiguous in [B,S,H,D] layout");
+      TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
+                  "k and v must be on the same XPU device as q");
+      TORCH_CHECK(out.device() == q.device() && lse.device() == q.device(),
+                  "out and lse must be on the same XPU device as q");
+      TORCH_CHECK(out.scalar_type() == at::kBFloat16,
+                  "out must have bfloat16 dtype");
+      TORCH_CHECK(lse.scalar_type() == at::kFloat,
+                  "lse must have float32 dtype");
+      TORCH_CHECK(out.dim() == 4 && out.is_contiguous(),
+                  "out must be a contiguous rank-4 [B,Sq,Hq,Dvo] tensor");
+      TORCH_CHECK(lse.dim() == 3 && lse.is_contiguous(),
+                  "lse must be a contiguous rank-3 [B,Sq,Hq] tensor");
+
+      const int64_t headSizeVO = v.size(3);
+      TORCH_CHECK(headSizeVO == 64 || headSizeVO == 96 ||
+                        headSizeVO == 128 || headSizeVO == 192,
+                  "v head dimension must be one of 64, 96, 128, or 192");
+      TORCH_CHECK(k.size(0) == q.size(0) && v.size(0) == q.size(0),
+                  "k/v batch dimension must match q");
+      TORCH_CHECK(k.size(1) == v.size(1) && k.size(2) == v.size(2),
+                  "v must match k in seq_len_kv and num_heads_kv");
+      TORCH_CHECK(k.size(3) == q.size(3),
+                  "k last dimension must equal q last dimension");
+      TORCH_CHECK(q.size(3) % 32 == 0,
+                  "q/k head dimension must be a positive multiple of 32");
+      TORCH_CHECK(q.size(2) % k.size(2) == 0,
+                  "num_heads_q must be divisible by num_heads_kv");
+      TORCH_CHECK(out.size(0) == q.size(0) && out.size(1) == q.size(1) &&
+                        out.size(2) == q.size(2) && out.size(3) == headSizeVO,
+                  "out shape must be [B, Sq, Hq, Dvo]");
+      TORCH_CHECK(lse.size(0) == q.size(0) && lse.size(1) == q.size(1) &&
+                        lse.size(2) == q.size(2),
+                  "lse shape must be [B, Sq, Hq]");
+
+      TORCH_CHECK(q.device().has_index(),
+                  "q must have a concrete XPU device index");
+      const auto deviceIndex = q.device().index();
+      TORCH_CHECK(deviceIndex >= 0,
+                  "q must have a non-negative XPU device index");
+      CompatDeviceGuard deviceGuard(static_cast<unsigned int>(deviceIndex));
+
+      auto qView = q.permute({0, 2, 1, 3});
+      auto kView = k.permute({0, 2, 1, 3});
+      auto vView = v.permute({0, 2, 1, 3});
+      auto outView = out.permute({0, 2, 1, 3});
+      std::array<int64_t, 3> qStrides{
+            qView.stride(2), qView.stride(1), qView.stride(0)};
+      std::array<int64_t, 3> kStrides{
+            kView.stride(2), kView.stride(1), kView.stride(0)};
+      std::array<int64_t, 3> vStrides{
+            vView.stride(2), vView.stride(1), vView.stride(0)};
+      std::array<int64_t, 3> oStrides{
+            outView.stride(2), outView.stride(1), outView.stride(0)};
+      // Match prefill_bf16_bshd_kv_list exactly: lse is [B, Sq, Hq] and the
+      // kernel wants {stride_lse_q, stride_lse_h, stride_lse_b}.
+      std::array<int64_t, 3> lseStrides{
+            lse.stride(1), lse.stride(2), lse.stride(0)};
+
+      const int ret = prefillBf16Impl(
+            static_cast<int>(q.size(0)), static_cast<int>(q.size(2)),
+            static_cast<int>(k.size(2)), static_cast<int>(q.size(1)),
+            static_cast<int>(k.size(1)), static_cast<int>(q.size(3)),
+            static_cast<int>(headSizeVO), /*isCausal=*/false,
+            /*iterations=*/1, /*warmup=*/0, /*verify=*/0,
+            qView.data_ptr(), kView.data_ptr(), vView.data_ptr(),
+            outView.data_ptr(), qStrides.data(), kStrides.data(),
+            vStrides.data(), oStrides.data(),
+            lse.data_ptr<float>(), /*accumulateOutput=*/roundIdx != 0,
+            lseStrides.data());
+      TORCH_CHECK(ret == 0,
+                  "prefill_bf16_bshd_kv_round failed in kernel run");
+}
+
 int prefillBf16Benchmark(int batch = 32, int numHeadsQ = 16, int numHeadsKV = 16,
                          int seqLenQO = 512, int seqLenKV = 512,
                          int headSizeQK = 128, int headSizeVO = 128,
@@ -604,4 +704,10 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         py::arg("q"), py::arg("k_list"), py::arg("v_list"),
         py::arg("is_causal") = false,
         py::arg("return_lse") = false);
+  m.def("prefill_bf16_bshd_kv_round", &prefillBf16TensorBSHDKVRound,
+        "One ring-attention KV round over a single contiguous [B,S,H,D] K/V "
+        "block: LSE-merge Q@KV into caller-owned out/lse. round_idx==0 "
+        "initializes, round_idx>0 accumulates.",
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("out"), py::arg("lse"), py::arg("round_idx"));
 }
