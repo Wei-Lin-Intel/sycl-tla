@@ -225,55 +225,90 @@ struct PendingCopy {
 // Public API
 // ---------------------------------------------------------------------------
 
-// Export the IPC handle of a tensor's storage. Returns raw handle bytes as a
-// Python bytes object suitable for exchange over torch.distributed.
-py::bytes ipc_get_handle(const at::Tensor &t, uintptr_t queue_ptr) {
+// Export the IPC handle of a tensor's storage, together with the tensor's byte
+// offset inside its L0 allocation.
+//
+// zeMemGetIpcHandle/zeMemOpenIpcHandle operate on whole allocations: the peer
+// always receives the *base* address of the slab, never the address we passed
+// in. PyTorch's caching allocator sub-allocates, so several ring buffers can
+// share one slab and thus one identical handle blob. Without the offset the
+// receiver reads from the slab head instead of the tensor.
+std::pair<py::bytes, int64_t> ipc_get_handle(const at::Tensor &t,
+                                             uintptr_t queue_ptr) {
   TORCH_CHECK(t.is_contiguous(), "tensor must be contiguous to export IPC");
   auto env = env_for_tensor(t, queue_ptr);
+
+  void *ptr = t.data_ptr();
+  void *base = nullptr;
+  size_t alloc_size = 0;
+  zeCheck(zeMemGetAddressRange(env->context, ptr, &base, &alloc_size),
+          "zeMemGetAddressRange");
+
+  const int64_t offset =
+      static_cast<int64_t>(reinterpret_cast<uintptr_t>(ptr) -
+                           reinterpret_cast<uintptr_t>(base));
+  TORCH_CHECK(offset >= 0 &&
+                  static_cast<size_t>(offset) + t.nbytes() <= alloc_size,
+              "tensor [", offset, ", +", t.nbytes(),
+              ") does not lie inside its L0 allocation of size ", alloc_size);
+
   ze_ipc_mem_handle_t handle = {};
-  zeCheck(zeMemGetIpcHandle(env->context, t.data_ptr(), &handle),
+  zeCheck(zeMemGetIpcHandle(env->context, base, &handle),
           "zeMemGetIpcHandle");
-  return py::bytes(reinterpret_cast<const char *>(handle.data),
-                   sizeof(handle.data));
+  return {py::bytes(reinterpret_cast<const char *>(handle.data),
+                    sizeof(handle.data)),
+          offset};
 }
 
 uintptr_t ipc_open_handle(const at::Tensor &like, const py::bytes &handle_bytes,
-                          uintptr_t queue_ptr) {
+                          int64_t offset, uintptr_t queue_ptr) {
   auto env = env_for_tensor(like, queue_ptr);
   std::string key = handle_bytes;
+
+  // The cache is keyed by slab handle; buffers sharing a slab are told apart
+  // by their offset, so one zeMemOpenIpcHandle per slab is correct.
+  void *peer_base = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_peer_mutex);
     auto it = g_opened_peers.find(key);
     if (it != g_opened_peers.end()) {
-      return reinterpret_cast<uintptr_t>(it->second);
+      peer_base = it->second;
     }
   }
-  ze_ipc_mem_handle_t handle = {};
-  std::memcpy(handle.data, key.data(),
-              std::min(sizeof(handle.data), key.size()));
-  void *peer_ptr = nullptr;
-  zeCheck(zeMemOpenIpcHandle(env->context, env->device, handle,
-                             ZE_IPC_MEMORY_FLAG_BIAS_CACHED, &peer_ptr),
-          "zeMemOpenIpcHandle");
-  {
+  if (peer_base == nullptr) {
+    ze_ipc_mem_handle_t handle = {};
+    TORCH_CHECK(key.size() == sizeof(handle.data),
+                "bad IPC handle size: ", key.size());
+    std::memcpy(handle.data, key.data(), sizeof(handle.data));
+    // UNCACHED: a cached bias on remote memory can serve stale lines after the
+    // peer overwrites the buffer in a later ring round.
+    zeCheck(zeMemOpenIpcHandle(env->context, env->device, handle,
+                               ZE_IPC_MEMORY_FLAG_BIAS_UNCACHED, &peer_base),
+            "zeMemOpenIpcHandle");
     std::lock_guard<std::mutex> lock(g_peer_mutex);
-    g_opened_peers[key] = peer_ptr;
+    g_opened_peers[key] = peer_base;
   }
-  return reinterpret_cast<uintptr_t>(peer_ptr);
+  return reinterpret_cast<uintptr_t>(peer_base) +
+         static_cast<uintptr_t>(offset);
 }
 
 void ipc_close_handle(const at::Tensor &like, uintptr_t peer_ptr,
-                      uintptr_t queue_ptr) {
+                      int64_t offset, uintptr_t queue_ptr) {
   auto env = env_for_tensor(like, queue_ptr);
-  void *p = reinterpret_cast<void *>(peer_ptr);
+  // Must close the slab base, not the offset pointer we handed to Python.
+  void *base = reinterpret_cast<void *>(peer_ptr -
+                                        static_cast<uintptr_t>(offset));
+  bool still_mapped = false;
   {
     std::lock_guard<std::mutex> lock(g_peer_mutex);
     for (auto it = g_opened_peers.begin(); it != g_opened_peers.end();) {
-      if (it->second == p) it = g_opened_peers.erase(it);
+      if (it->second == base) { it = g_opened_peers.erase(it); still_mapped = true; }
       else ++it;
     }
   }
-  zeCheck(zeMemCloseIpcHandle(env->context, p), "zeMemCloseIpcHandle");
+  if (still_mapped) {
+    zeCheck(zeMemCloseIpcHandle(env->context, base), "zeMemCloseIpcHandle");
+  }
 }
 
 uintptr_t ipc_copy_from_peer_async(at::Tensor &dst_local, uintptr_t peer_src,
@@ -324,9 +359,11 @@ PYBIND11_MODULE(sycl_tla_ipc_p2p, m) {
   m.def("ipc_get_handle", &ipc_get_handle,
         py::arg("tensor"), py::arg("queue_ptr"));
   m.def("ipc_open_handle", &ipc_open_handle,
-        py::arg("like_tensor"), py::arg("handle_bytes"), py::arg("queue_ptr"));
+        py::arg("like_tensor"), py::arg("handle_bytes"), py::arg("offset"),
+        py::arg("queue_ptr"));
   m.def("ipc_close_handle", &ipc_close_handle,
-        py::arg("like_tensor"), py::arg("peer_ptr"), py::arg("queue_ptr"));
+        py::arg("like_tensor"), py::arg("peer_ptr"), py::arg("offset"),
+        py::arg("queue_ptr"));
   m.def("ipc_copy_from_peer_async", &ipc_copy_from_peer_async,
         py::arg("dst_local"), py::arg("peer_src"), py::arg("nbytes"),
         py::arg("queue_ptr"));
