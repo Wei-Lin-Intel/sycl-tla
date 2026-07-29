@@ -710,4 +710,8 @@ PYBIND11_MODULE(sycl_tla_fmha, m) {
         "initializes, round_idx>0 accumulates.",
         py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("out"), py::arg("lse"), py::arg("round_idx"));
+  m.def("compat_queue_ptr", []() -> uintptr_t {
+        static sycl::queue q = compat::get_default_queue();
+        return reinterpret_cast<uintptr_t>(&q);
+  });
 }
