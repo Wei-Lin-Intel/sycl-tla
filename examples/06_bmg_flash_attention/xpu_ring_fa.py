@@ -133,7 +133,6 @@ def main():
     S_global = args.q_seq_len
     assert S_global % world == 0, "q-seq-len must be divisible by world size"
     s_local = S_global // world
-    assert s_local % 32 == 0, "s_local must be a multiple of TileK (32)"
     Hq, Hkv, Dqk, Dvo = args.q_nhead, args.kv_nhead, args.qk_hdim, args.v_hdim
     assert Hq % Hkv == 0 and Dqk % 32 == 0
 
