@@ -13,6 +13,15 @@ while computing acc += A @ buf[read_slot].
 Triple buffering keeps the copy destination two slots away from the buffer the
 (asynchronous) matmul is still reading, so no per-round device sync is needed.
 
+Memory model
+------------
+All ring buffers are views into ONE IpcArena, so exactly one IPC handle is
+exported and opened per process. Never export a caching-allocator slab: PyTorch
+recycles and reuses slabs, which turns the peer's mapping into a dangling
+pointer (or worse, silently aliases an unrelated tensor with identical handle
+bytes). Unlike the attention benchmark, B is loop-invariant here, so slot 0 is
+staged exactly once at construction -- there is no per-iteration copy.
+
 Run the transfer self-check first:
     torchrun --nproc-per-node 4 xpu_ring_gemm_ipc.py --check-transfer
 Then the benchmark:
@@ -20,6 +29,7 @@ Then the benchmark:
 """
 
 import argparse
+import atexit
 import os
 import time
 
@@ -35,6 +45,13 @@ import sycl_tla_ipc_p2p as ipc
 # (asynchronous) matmul and being recycled as a copy destination.
 NUM_BUFFERS = 4
 
+# Arena slot alignment. IpcArena.view() requires >= 256B.
+SLOT_ALIGN = 4096
+
+
+def _align_up(v, a=SLOT_ALIGN):
+    return (v + a - 1) // a * a
+
 
 def read_slot_of(step):
     """Slot holding the block valid at round `step`."""
@@ -44,6 +61,7 @@ def read_slot_of(step):
 def write_slot_of(step):
     """Slot the copy issued at round `step` lands in."""
     return 1 + (step % (NUM_BUFFERS - 1))
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -104,46 +122,71 @@ def current_queue_ptr(device):
 
 class IpcRing:
     """
-    Owns NUM_BUFFERS ring buffers for B and the opened peer pointers of the
-    previous rank. Buffers are allocated once and never replaced, because their
-    device addresses are baked into the exported IPC handles.
+    Owns one IpcArena holding NUM_BUFFERS B slots, plus the opened mapping of
+    the previous rank.
+
+    Because every buffer is a view into a single arena, exactly one IPC handle
+    is exported and opened for the lifetime of the process. The handle can never
+    dangle, regardless of what the caching allocator does with unrelated
+    tensors.
     """
 
     def __init__(self, b_local, rank, world, queue_ptr):
         self.rank = rank
         self.world = world
         self.queue_ptr = queue_ptr
+        self.dev_index = b_local.device.index
         self.prev_rank = (rank - 1) % world
 
-        self.buf = [b_local.contiguous()]
-        for _ in range(NUM_BUFFERS - 1):
-            self.buf.append(torch.empty_like(b_local))
-        self.nbytes = self.buf[0].numel() * self.buf[0].element_size()
+        self.shape = list(b_local.shape)
+        self.dtype = b_local.dtype
+        self.nbytes = b_local.numel() * b_local.element_size()
 
-        # Export every buffer: the pull side cycles through all of them.
-        # ipc_get_handle returns (handle_bytes, offset_within_allocation).
-        local = [ipc.ipc_get_handle(b, queue_ptr) for b in self.buf]
+        # Arena layout: slot0[B] slot1[B] ... each slot 4KB aligned.
+        self.slot_stride = _align_up(self.nbytes)
+        total = self.slot_stride * NUM_BUFFERS
+        self.arena = ipc.make_arena(self.dev_index, total, queue_ptr)
 
+        self.off = [i * self.slot_stride for i in range(NUM_BUFFERS)]
+        self.buf = [self.arena.view(o, self.shape, self.dtype)
+                    for o in self.off]
+
+        # slot 0 permanently holds this rank's own B. Staged once: unlike the
+        # ring-attention case, B is loop-invariant, so there is no per-iteration
+        # staging copy to account for.
+        self.buf[0].copy_(b_local)
+        torch.xpu.current_stream(b_local.device).synchronize()
+
+        # One handle exchange for the lifetime of the process. Slot offsets are
+        # identical on every rank, so only the arena base needs to travel.
+        self.local_handle = self.arena.export_handle()
         gathered = [None] * world
-        dist.all_gather_object(gathered, local)
+        dist.all_gather_object(gathered, self.local_handle)
+        self.peer_handle = gathered[self.prev_rank]
 
-        peer = gathered[self.prev_rank]
-        self.peer_offset = [int(off) for _, off in peer]
-        self.peer_ptr = [
-            ipc.ipc_open_handle(self.buf[0], h, int(off), queue_ptr)
-            for h, off in peer
-        ]
+        peer_base = ipc.open_peer(self.dev_index, self.peer_handle, queue_ptr)
+        self.peer_ptr = [peer_base + o for o in self.off]
+
+        self._closed = False
+        atexit.register(self.close)
+
         # Every rank must have opened its peer before any copy is issued.
         dist.barrier()
         torch.xpu.synchronize()
 
     def close(self):
-        for p, off in zip(self.peer_ptr, self.peer_offset):
-            try:
-                ipc.ipc_close_handle(self.buf[0], p, off, self.queue_ptr)
-            except Exception:
-                pass
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            torch.xpu.synchronize()
+            ipc.close_peer(self.dev_index, self.peer_handle, self.queue_ptr)
+        except Exception:
+            pass
         self.peer_ptr = []
+        # Arena views must die before the arena; the arena itself is released by
+        # ipc.shutdown().
+        self.buf = []
 
 
 def ring_rotate(ring, consume):
@@ -160,12 +203,16 @@ def ring_rotate(ring, consume):
     write-slot rotation provides. buf[0] is never a write target, so the next
     pass starts from this rank's own block with no restore copy.
     """
+    base = ring.arena.base_ptr()
+
     for step in range(ring.world):
         pending = None
         if step < ring.world - 1:
-            pending = ipc.ipc_copy_from_peer_async(
-                ring.buf[write_slot_of(step)],
-                ring.peer_ptr[read_slot_of(step)],
+            rs, ws = read_slot_of(step), write_slot_of(step)
+            pending = ipc.copy_async(
+                ring.dev_index,
+                base + ring.off[ws],
+                ring.peer_ptr[rs],
                 ring.nbytes,
                 ring.queue_ptr,
             )
@@ -174,10 +221,7 @@ def ring_rotate(ring, consume):
         consume(ring.buf[read_slot_of(step)], step)
 
         if pending is not None:
-            ipc.ipc_wait(pending)
-
-    # One fence per pass keeps ranks from accumulating drift across loops.
-    dist.barrier()
+            pending.wait()
 
 
 def main():
@@ -229,13 +273,14 @@ def main():
         if failures:
             for step, bad, total in failures:
                 print(f"[rank {rank}] round {step}: FAILED, "
-                      f"{bad}/{total} bytes differ", flush=True)
+                      f"{bad}/{total} elements differ", flush=True)
         else:
             print(f"[rank {rank}] IPC rotation: PASSED "
                   f"({world} rounds, bit-exact)", flush=True)
         dist.barrier()
         ring.close()
         dist.barrier()
+        ipc.shutdown()
         dist.destroy_process_group()
         return
 
@@ -246,11 +291,13 @@ def main():
         print(f"  B shape (per rank) : [{K}, {N}]")
         print(f"  Ring buffers       : {NUM_BUFFERS} "
               f"(1 pinned + {NUM_BUFFERS - 1} rotating)")
+        print(f"  Arena size         : {ring.arena.nbytes() / 1024**2:.1f} MiB")
         print(f"  Data type          : {dtype}")
         print(f"  Accumulator dtype  : {acc.dtype}")
         print(f"  Bootstrap backend  : {args.backend}")
         print("  Transfer path      : zeCommandListAppendMemoryCopy "
               "(dedicated copy engine)")
+        print("  Per-loop staging   : none (B is loop-invariant)")
         print(f"  Verify             : {not args.skip_verify}")
         print(f"  Warmup / loops     : {args.warmup} / {args.loops}")
 
@@ -301,13 +348,13 @@ def main():
     per_rank_flops = gemm_flops(M, K, N) * world      # world GEMMs per rank
     aggregate_flops = per_rank_flops * world
     average_seconds = elapsed_max / args.loops
+    moved_bytes = ring.nbytes * (world - 1)
 
     if rank == 0:
         print("\nResults")
         print(f"  Output shape       : {list(acc.shape)}")
         print(f"  Per-rank B bytes   : {ring.nbytes / 1024**2:.1f} MiB")
-        print(f"  Moved / loop / rank: "
-              f"{ring.nbytes * (world - 1) / 1024**2:.1f} MiB")
+        print(f"  Moved / loop / rank: {moved_bytes / 1024**2:.1f} MiB")
         print(f"  Average latency    : {average_seconds * 1e3:.3f} ms")
         print(f"  FLOPs/loop (rank)  : {per_rank_flops / 1e12:.6f} TFLOP")
         print(f"  FLOPs/loop (total) : {aggregate_flops / 1e12:.6f} TFLOP")
@@ -316,7 +363,7 @@ def main():
         print(f"  Aggregate through. : "
               f"{aggregate_flops / average_seconds / 1e12:.3f} TFLOPs")
         print(f"  Effective P2P BW   : "
-              f"{ring.nbytes * (world - 1) / average_seconds / 1e9:.2f} GB/s "
+              f"{moved_bytes / average_seconds / 1e9:.2f} GB/s "
               f"(per rank, overlapped)")
 
     if not args.skip_verify:
@@ -347,6 +394,8 @@ def main():
     dist.barrier()
     ring.close()
     dist.barrier()
+    # shutdown 必须早于 destroy_process_group，且早于解释器卸载 extension。
+    ipc.shutdown()
     if dist.is_initialized():
         dist.destroy_process_group()
 

@@ -23,6 +23,7 @@ Launch (world >= 2):
 """
 
 import argparse
+import atexit
 import os
 import time
 
@@ -40,6 +41,10 @@ import sycl_tla_ipc_p2p as ipc
 # (asynchronous) attention kernel and being recycled as a write target.
 NUM_BUFFERS = 4
 
+SLOT_ALIGN = 4096
+
+def _align_up(v, a=SLOT_ALIGN):
+    return (v + a - 1) // a * a
 
 def read_slot_of(step):
     """Slot holding the K/V block valid at round `step`."""
@@ -127,71 +132,101 @@ def current_queue_ptr(device):
 
 class IpcKVRing:
     """
-    Owns NUM_BUFFERS ring buffers for K and V plus the opened peer pointers of
-    the previous rank. Buffers are allocated once and never replaced: their
-    device addresses are baked into the exported IPC handles.
+    所有 ring buffer 都住在一块 IpcArena 里：进程生命周期内只导出 1 个 IPC handle、
+    只 open 1 次对端。这样上层每层新建的 k/v tensor 只需要 stage() 进 slot 0，
+    handle 永远不会因为 caching allocator 回收/复用 slab 而变野指针。
     """
 
     def __init__(self, k_local, v_local, rank, world, queue_ptr):
         self.rank = rank
         self.world = world
         self.queue_ptr = queue_ptr
+        self.dev_index = k_local.device.index
         self.prev_rank = (rank - 1) % world
 
-        self.kbuf = [k_local.contiguous()]
-        self.vbuf = [v_local.contiguous()]
-        for _ in range(NUM_BUFFERS - 1):
-            self.kbuf.append(torch.empty_like(k_local))
-            self.vbuf.append(torch.empty_like(v_local))
+        self.k_shape = list(k_local.shape)
+        self.v_shape = list(v_local.shape)
+        self.dtype = k_local.dtype
+        self.k_nbytes = k_local.numel() * k_local.element_size()
+        self.v_nbytes = v_local.numel() * v_local.element_size()
 
-        self.k_nbytes = self.kbuf[0].numel() * self.kbuf[0].element_size()
-        self.v_nbytes = self.vbuf[0].numel() * self.vbuf[0].element_size()
+        # arena 布局: slot0[K][V] slot1[K][V] ... 每段 4KB 对齐。
+        self.k_off_in_slot = 0
+        self.v_off_in_slot = _align_up(self.k_nbytes)
+        self.slot_stride = _align_up(self.v_off_in_slot + self.v_nbytes)
+        total = self.slot_stride * NUM_BUFFERS
 
-        # ipc_get_handle returns (handle_bytes, offset_within_allocation).
-        # K and V buffers frequently share one caching-allocator slab, so the
-        # offset is what keeps their peer pointers distinct.
-        local = {
-            "k": [ipc.ipc_get_handle(b, queue_ptr) for b in self.kbuf],
-            "v": [ipc.ipc_get_handle(b, queue_ptr) for b in self.vbuf],
-        }
+        self.arena = ipc.make_arena(self.dev_index, total, queue_ptr)
+
+        self.k_off = [i * self.slot_stride + self.k_off_in_slot
+                      for i in range(NUM_BUFFERS)]
+        self.v_off = [i * self.slot_stride + self.v_off_in_slot
+                      for i in range(NUM_BUFFERS)]
+        self.kbuf = [self.arena.view(o, self.k_shape, self.dtype)
+                     for o in self.k_off]
+        self.vbuf = [self.arena.view(o, self.v_shape, self.dtype)
+                     for o in self.v_off]
+
+        # slot 0 常驻本 rank 自己的 K/V。
+        self.stage(k_local, v_local)
+
+        # 只交换一次 arena base handle；各 slot 的 offset 所有 rank 一致。
+        self.local_handle = self.arena.export_handle()
         gathered = [None] * world
-        dist.all_gather_object(gathered, local)
-        peer = gathered[self.prev_rank]
+        dist.all_gather_object(gathered, self.local_handle)
+        self.peer_handle = gathered[self.prev_rank]
 
-        self.k_peer_off = [int(o) for _, o in peer["k"]]
-        self.v_peer_off = [int(o) for _, o in peer["v"]]
-        self.k_peer_ptr = [
-            ipc.ipc_open_handle(self.kbuf[0], h, int(o), queue_ptr)
-            for h, o in peer["k"]
-        ]
-        self.v_peer_ptr = [
-            ipc.ipc_open_handle(self.vbuf[0], h, int(o), queue_ptr)
-            for h, o in peer["v"]
-        ]
+        peer_base = ipc.open_peer(self.dev_index, self.peer_handle, queue_ptr)
+        self.k_peer_ptr = [peer_base + o for o in self.k_off]
+        self.v_peer_ptr = [peer_base + o for o in self.v_off]
 
-        # Every rank must have opened its peer before any copy is issued.
+        self._closed = False
+        atexit.register(self.close)
+
+        # 任何 copy 发出前，所有 rank 必须已经 open 完对端。
         dist.barrier()
         torch.xpu.synchronize()
 
+    def stage(self, k_new, v_new):
+        """
+        把新一层的 K/V 写进 slot 0（本地 D2D，走 torch compute queue）。
+
+        每层 transformer 都会调一次：上层算出的 k/v 是全新的 caching-allocator
+        tensor，不能直接导出 IPC handle，必须先搬进 arena。
+
+        这里必须同步：copy_ 排在 compute queue 上，而下一步的 copy engine 看不到
+        它。同步点必须在“对端可能开始拉取本 rank slot 0”之前，也就是 pass 开始前。
+        """
+        self.kbuf[0].copy_(k_new)
+        self.vbuf[0].copy_(v_new)
+        # 只等当前 stream，不等整个设备；语义足够且比 torch.xpu.synchronize() 轻。
+        torch.xpu.current_stream(self.kbuf[0].device).synchronize()
+
     def close(self):
-        for p, o in zip(self.k_peer_ptr, self.k_peer_off):
-            try:
-                ipc.ipc_close_handle(self.kbuf[0], p, o, self.queue_ptr)
-            except Exception:
-                pass
-        for p, o in zip(self.v_peer_ptr, self.v_peer_off):
-            try:
-                ipc.ipc_close_handle(self.vbuf[0], p, o, self.queue_ptr)
-            except Exception:
-                pass
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            torch.xpu.synchronize()
+            ipc.close_peer(self.dev_index, self.peer_handle, self.queue_ptr)
+        except Exception:
+            pass
         self.k_peer_ptr = []
         self.v_peer_ptr = []
+        # arena view 必须先失效，arena 本身由 ipc.shutdown() 释放。
+        self.kbuf = []
+        self.vbuf = []
 
 
-def ring_attention_ipc(ring, consume):
+def ring_attention_ipc(ring, consume, kv_new=None):
     """
     One full ring pass. Round s presents the K/V block owned by rank
     (rank - s) % world and calls consume(k_block, v_block, s).
+
+    kv_new: optional (k, v) freshly produced by the caller (a transformer layer
+    in the real workload). Staged into slot 0 before the ring starts, which is
+    what upstream code will actually do every layer. Pass None to reuse whatever
+    slot 0 already holds.
 
     All ranks follow the identical slot schedule, so rank r pulls from
     prev_rank's buf[read_slot_of(s)] -- the slot the peer reads this round --
@@ -202,26 +237,30 @@ def ring_attention_ipc(ring, consume):
     write-slot rotation provides. buf[0] is never a write target, so the next
     pass starts from this rank's own block with no restore copy.
     """
+
+    if kv_new is not None:
+        # 安全性依赖 pass 尾部的 dist.barrier(): 它保证上一轮所有 rank 都已读完
+        # 本 rank 的 slot 0，这里覆写才不会打断对端还在进行的拉取。
+        ring.stage(kv_new[0], kv_new[1])
+
     for step in range(ring.world):
         pending = []
         if step < ring.world - 1:
             rs, ws = read_slot_of(step), write_slot_of(step)
-            pending.append(ipc.ipc_copy_from_peer_async(
-                ring.kbuf[ws], ring.k_peer_ptr[rs],
-                ring.k_nbytes, ring.queue_ptr))
-            pending.append(ipc.ipc_copy_from_peer_async(
-                ring.vbuf[ws], ring.v_peer_ptr[rs],
-                ring.v_nbytes, ring.queue_ptr))
+            base = ring.arena.base_ptr()
+            pending.append(ipc.copy_async(
+                ring.dev_index, base + ring.k_off[ws],
+                ring.k_peer_ptr[rs], ring.k_nbytes, ring.queue_ptr))
+            pending.append(ipc.copy_async(
+                ring.dev_index, base + ring.v_off[ws],
+                ring.v_peer_ptr[rs], ring.v_nbytes, ring.queue_ptr))
 
         rs = read_slot_of(step)
         # Enqueued asynchronously; overlaps the copy engine transfers above.
         consume(ring.kbuf[rs], ring.vbuf[rs], step)
 
         for h in pending:
-            ipc.ipc_wait(h)
-
-    # One fence per pass keeps ranks from accumulating drift across loops.
-    dist.barrier()
+            h.wait()
 
 
 def main():
@@ -282,7 +321,7 @@ def main():
             if not torch.equal(vb, v_ref):
                 failures.append((step, "V", (vb != v_ref).sum().item()))
 
-        ring_attention_ipc(ring, check)
+        ring_attention_ipc(ring, check, kv_new=(k_local, v_local))
         torch.xpu.synchronize()
         if failures:
             for step, which, bad in failures:
@@ -294,17 +333,21 @@ def main():
         dist.barrier()
         ring.close()
         dist.barrier()
+        ipc.shutdown()
         dist.destroy_process_group()
         return
 
     def run_ring():
         # round_idx drives the epilogue: 0 initializes out/lse, >0 LSE-merges.
         # out/lse accumulate across the whole pass and must not be reset.
+        # kv_new 模拟真实场景：每层 transformer 产出新的 k/v tensor，先 stage 进
+        # arena 再进 ring。这次 D2D copy 是实际部署时无法回避的开销。
         ring_attention_ipc(
             ring,
             lambda kb, vb, step: fa.prefill_bf16_bshd_kv_round(
                 q=q, k=kb, v=vb, out=out, lse=lse, round_idx=step,
             ),
+            kv_new=(k_local, v_local),
         )
 
     element_size = torch.tensor([], dtype=dtype).element_size()
@@ -325,6 +368,8 @@ def main():
         print(f"  Bootstrap backend  : {args.backend}")
         print("  Transfer path      : zeCommandListAppendMemoryCopy "
               "(dedicated copy engine)")
+        print("  Per-loop staging   : enabled (new K/V copied into arena, "
+              "matches per-layer model behavior)")
         print(f"  Verify             : {not args.skip_verify}")
         print(f"  Profile            : {args.profile}")
         print(f"  Warmup loops       : {args.warmup}")
@@ -389,6 +434,8 @@ def main():
 
     average_seconds = elapsed_max / args.loops
     moved_bytes = kv_bytes * (world - 1)
+    # stage() 每 pass 一次本地 D2D（写 + 读），计入有效带宽会更贴近真实。
+    staged_bytes = kv_bytes
 
     if rank == 0:
         print("\nResults")
@@ -397,6 +444,8 @@ def main():
         print(f"  Per-rank Q memory  : {q_bytes / 1024**3:.3f} GiB")
         print(f"  Per-rank KV memory : {kv_bytes / 1024**3:.3f} GiB")
         print(f"  Moved / loop / rank: {moved_bytes / 1024**2:.1f} MiB")
+        print(f"  Staged / loop /rank: {staged_bytes / 1024**2:.1f} MiB "
+              f"(local D2D into arena slot 0)")
         print(f"  Total time (max)   : {elapsed_max:.6f} s")
         print(f"  Average latency    : {average_seconds * 1e3:.3f} ms")
         print(f"  FLOPs/loop (rank)  : {per_rank_flops / 1e12:.6f} TFLOP")
@@ -445,6 +494,8 @@ def main():
     dist.barrier()
     ring.close()
     dist.barrier()
+    # shutdown 必须早于 destroy_process_group，且早于解释器卸载 extension。
+    ipc.shutdown()
     if dist.is_initialized():
         dist.destroy_process_group()
 
