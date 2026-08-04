@@ -200,7 +200,7 @@ class IpcKVRing:
         self.kbuf[0].copy_(k_new)
         self.vbuf[0].copy_(v_new)
         # 只等当前 stream，不等整个设备；语义足够且比 torch.xpu.synchronize() 轻。
-        torch.xpu.current_stream(self.kbuf[0].device).synchronize()
+        torch.xpu.current_stream(self.vbuf[0].device).synchronize()
 
     def close(self):
         if self._closed:
