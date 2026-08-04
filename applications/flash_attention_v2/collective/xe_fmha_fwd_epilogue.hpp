@@ -226,7 +226,14 @@ public:
       auto thr_mnk =
           group<1,3>(TiledMMAPV{}.get_thr_layout_vmnk())
               .get_flat_coord(assert_uniform(thr_id));
-      int q_sg = get<0>(thr_mnk);
+      // ThrLayoutVMNK mode order is (V,M,N,K); group<1,3> collapses M,N into a
+      // single mode, giving (V,MN,K). get<0> is therefore the *lane* inside the
+      // subgroup, not the subgroup's q-tile index -- using it here made every
+      // lane of a subgroup claim a different row block, so LSE rows were both
+      // double-written and left untouched (torch::empty garbage), and the
+      // accumulate path read back old_lse from the wrong row.
+      // get<1> is the MN mode, matching reduce_A()'s a_tile.
+      int q_sg = get<1>(thr_mnk);
 
       // A single helper to reproduce the per-row query index + validity.
       // Cheap integer math, recomputed on demand -> avoids keeping per-row
