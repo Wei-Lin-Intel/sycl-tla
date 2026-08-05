@@ -242,6 +242,7 @@ def ring_attention_ipc(ring, consume, kv_new=None):
         # 安全性依赖 pass 尾部的 dist.barrier(): 它保证上一轮所有 rank 都已读完
         # 本 rank 的 slot 0，这里覆写才不会打断对端还在进行的拉取。
         ring.stage(kv_new[0], kv_new[1])
+        dist.barrier()
 
     for step in range(ring.world):
         pending = []
