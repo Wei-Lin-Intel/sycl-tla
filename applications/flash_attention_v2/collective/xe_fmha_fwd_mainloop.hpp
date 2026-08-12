@@ -405,7 +405,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       }
 
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
+      bool rescale_needed = true;
+      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, rescale_needed);
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension.
@@ -414,7 +415,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
         reorder(tVrV, tArV);
-        if (K != blk_k0) {
+        if (K != blk_k0 && rescale_needed) {
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tArA.size() / VTiles; i++)
             tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
@@ -470,17 +471,23 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
   softmax(bool       first_block, // First softmax block?
           FragS    & tS,          // Softmax src/dst block
           FragSRow & tS_max,      // Softmax row-wise max accumulator
-          FragSRow & tS_sum) {    // Softmax row-wise sum accumulator
+	  FragSRow & tS_sum,      // Softmax row-wise sum accumulator
+          bool     & rescale_needed) {  // out: false => rescale(i) == 1.0f for all i
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
     FragSRow rescale;
+    bool rescale_is_identity = true;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
       ElementS new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
       rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+      rescale_is_identity &= (rescale(i) == ElementS(1));
       tS_max(i) = new_max;
     }
+    rescale_needed = sycl::any_of_group(
+        sycl::ext::oneapi::this_work_item::get_sub_group(),
+        !rescale_is_identity);
 
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
