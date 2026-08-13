@@ -194,19 +194,6 @@ class IpcKVRing:
         dist.barrier()
         torch.xpu.synchronize()
 
-    def fence(self, device):
-        """
-        等产出 K/V 的 kernel 退休。
-
-        push 模型下不再需要把 K/V 搬进 arena：CE 的 source 只是一个本地指针，
-        不导出 IPC handle，因此 caching-allocator slab 被回收/复用的野指针问题
-        根本不存在 —— 那个坑只在 destination 侧，而 destination 永远是对端的槽。
-
-        但同步点省不掉：上层的 k/v 由 compute queue 上的 kernel 产出，而 CE 是
-        另一条引擎，看不到这个依赖。不等它就 push 会读到半成品。
-        """
-        torch.xpu.current_stream(device).synchronize()
-
     def close(self):
         if self._closed:
             return
@@ -248,10 +235,6 @@ def ring_attention_ipc(ring, consume, kv_new=None):
     """
 
     if kv_new is not None:
-        # 安全性依赖 pass 尾部的 dist.barrier(): 它保证上一轮所有 rank 都已读完
-        # 本 rank 的 slot 0，这里覆写才不会打断对端还在进行的拉取。
-        # 只 fence，不再 D2D。round 0 直接以调用方的 tensor 为 CE source。
-        ring.fence(kv_new[0].device)
         dist.barrier()
     k_src0, v_src0 = kv_new
 
@@ -509,14 +492,14 @@ def main():
         torch.xpu.synchronize()
 
         torch.testing.assert_close(
-            out.float(), ref.float(), atol=5e-2, rtol=5e-2
+            out.float(), ref.float(), atol=5e-3, rtol=5e-3
         )
         max_abs_diff = (out.float() - ref.float()).abs().max().item()
         if rank == 0:
             print("\nValidation")
             print("  Reference          : F.scaled_dot_product_attention")
             print("  Status             : PASSED")
-            print("  Tolerance          : atol=5e-2, rtol=5e-2")
+            print("  Tolerance          : atol=5e-3, rtol=5e-3")
         print(f"  [rank {rank}] max abs diff : {max_abs_diff:.6e}", flush=True)
 
     dist.barrier()
