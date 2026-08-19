@@ -234,9 +234,8 @@ def ring_attention_ipc(ring, consume, kv_new=None):
     own block with no restore copy.
     """
 
-    if kv_new is not None:
-        dist.barrier()
     k_src0, v_src0 = kv_new
+    torch.xpu.current_stream(v_src0.device).synchronize()
 
     for step in range(ring.world):
         pending = []
