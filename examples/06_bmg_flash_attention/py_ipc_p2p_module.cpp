@@ -20,18 +20,582 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 
+#include <linux/futex.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Linux cross-process control plane.
+//
+// Ring data still moves through Level-Zero IPC CE writes. This control plane
+// only transports small host-side epochs:
+//
+//   handle_ready[rank]        IPC arena handle published during bootstrap
+//   ready[rank][slot]         K/V slot has been completely written
+//   free[rank][slot]          rank has finished consuming the old slot value
+//   barrier_epoch[rank]       infrequent non-hot-path rendezvous
+//   work_done[rank]           all local compute/copies stopped at teardown
+//   mapping_closed[rank]      rank closed its mapping to next_rank
+//   elapsed_ready[rank]       benchmark elapsed_ns value is available
+//
+// FUTEX_WAIT, rather than FUTEX_WAIT_PRIVATE, is required because the mapping
+// is shared between processes.
+// ---------------------------------------------------------------------------
+constexpr uint64_t kRingControlMagic = 0x5359434c52494e47ULL; // "SYCLRING"
+constexpr uint32_t kRingControlVersion = 2;
+
+inline size_t align_up_size(size_t value, size_t alignment) {
+  return (value + alignment - 1) / alignment * alignment;
+}
+
+struct alignas(64) RingControlHeader {
+  std::atomic<uint32_t> initialized;
+  uint32_t version;
+  uint32_t world;
+  uint32_t slots;
+  uint32_t handle_bytes;
+  uint32_t reserved;
+  uint64_t magic;
+};
+
+struct RingControlLayout {
+  size_t total_size = 0;
+  size_t handle_ready_off = 0;
+  size_t handles_off = 0;
+  size_t ready_off = 0;
+  size_t free_off = 0;
+  size_t barrier_epoch_off = 0;
+  size_t work_done_off = 0;
+  size_t mapping_closed_off = 0;
+  size_t elapsed_ready_off = 0;
+  size_t elapsed_ns_off = 0;
+};
+
+RingControlLayout ring_control_layout(uint32_t world, uint32_t slots,
+                                      uint32_t handle_bytes) {
+  RingControlLayout l;
+  size_t off = align_up_size(sizeof(RingControlHeader), 64);
+
+  l.handle_ready_off = off;
+  off += sizeof(std::atomic<uint32_t>) * world;
+  off = align_up_size(off, 64);
+
+  l.handles_off = off;
+  off += static_cast<size_t>(world) * handle_bytes;
+  off = align_up_size(off, 64);
+
+  l.ready_off = off;
+  off += sizeof(std::atomic<uint32_t>) *
+         static_cast<size_t>(world) * slots;
+  off = align_up_size(off, 64);
+
+  l.free_off = off;
+  off += sizeof(std::atomic<uint32_t>) *
+         static_cast<size_t>(world) * slots;
+  off = align_up_size(off, 64);
+
+  l.barrier_epoch_off = off;
+  off += sizeof(std::atomic<uint32_t>) * world;
+  off = align_up_size(off, 64);
+
+  l.work_done_off = off;
+  off += sizeof(std::atomic<uint32_t>) * world;
+  off = align_up_size(off, 64);
+
+  l.mapping_closed_off = off;
+  off += sizeof(std::atomic<uint32_t>) * world;
+  off = align_up_size(off, 64);
+
+ l.elapsed_ready_off = off;
+  off += sizeof(std::atomic<uint32_t>) * world;
+  off = align_up_size(off, 64);
+
+  l.elapsed_ns_off = off;
+  off += sizeof(uint64_t) * world;
+
+  l.total_size = align_up_size(off, 4096);
+  return l;
+}
+
+timespec duration_to_timespec(std::chrono::steady_clock::duration duration) {
+  if (duration <= std::chrono::steady_clock::duration::zero()) {
+    return timespec{0, 1};
+  }
+
+  const auto ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+  timespec ts{};
+  ts.tv_sec = static_cast<time_t>(ns / 1000000000LL);
+  ts.tv_nsec = static_cast<long>(ns % 1000000000LL);
+  return ts;
+}
+
+int futex_wait_shared(std::atomic<uint32_t> *address, uint32_t expected,
+                      const timespec *timeout) {
+  return static_cast<int>(
+      syscall(SYS_futex, reinterpret_cast<uint32_t *>(address),
+              FUTEX_WAIT, expected, timeout, nullptr, 0));
+}
+
+void futex_wake_shared(std::atomic<uint32_t> *address) {
+  syscall(SYS_futex, reinterpret_cast<uint32_t *>(address),
+          FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0);
+}
+
+void publish_epoch(std::atomic<uint32_t> *address, uint32_t epoch) {
+  address->store(epoch, std::memory_order_release);
+  futex_wake_shared(address);
+}
+
+void wait_epoch(std::atomic<uint32_t> *address, uint32_t target,
+                int64_t timeout_ms, const std::string &description) {
+  TORCH_CHECK(timeout_ms > 0, "timeout_ms must be positive");
+
+  const auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(timeout_ms);
+
+  // Short adaptive spin avoids a syscall when the CE completion notification
+  // is only a few microseconds away.
+  for (int i = 0; i < 256; ++i) {
+    if (address->load(std::memory_order_acquire) >= target) {
+      return;
+    }
+  }
+
+  for (;;) {
+    const uint32_t observed = address->load(std::memory_order_acquire);
+    if (observed >= target) {
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    TORCH_CHECK(
+        now < deadline,
+        "timed out waiting for ", description,
+        ": target epoch=", target, ", observed epoch=", observed,
+        ", timeout_ms=", timeout_ms);
+
+    const timespec relative_timeout =
+        duration_to_timespec(deadline - now);
+
+    errno = 0;
+    const int rc =
+        futex_wait_shared(address, observed, &relative_timeout);
+    if (rc == 0 || errno == EAGAIN || errno == EINTR) {
+      continue;
+    }
+
+    TORCH_CHECK(
+        errno != ETIMEDOUT,
+        "timed out waiting for ", description,
+        ": target epoch=", target, ", observed epoch=", observed,
+        ", timeout_ms=", timeout_ms);
+
+    TORCH_CHECK(false,
+                "futex wait failed while waiting for ", description,
+                ": errno=", errno, " (", std::strerror(errno), ")");
+  }
+}
+
+class RingControl {
+public:
+  RingControl(std::string name, int rank, int world, int slots,
+              int handle_bytes, int64_t timeout_ms)
+      : name_(std::move(name)),
+        rank_(rank),
+        world_(world),
+        slots_(slots),
+        handle_bytes_(handle_bytes),
+        timeout_ms_(timeout_ms),
+        layout_(ring_control_layout(
+            static_cast<uint32_t>(world),
+            static_cast<uint32_t>(slots),
+            static_cast<uint32_t>(handle_bytes))) {
+    TORCH_CHECK(!name_.empty() && name_[0] == '/',
+                "shared-memory name must start with '/'");
+    TORCH_CHECK(rank_ >= 0 && rank_ < world_,
+                "rank out of range: ", rank_, " for world ", world_);
+    TORCH_CHECK(world_ >= 2, "RingControl requires world >= 2");
+    TORCH_CHECK(slots_ >= 1 && slots_ <= world_ - 1,
+                "slots must be in [1, world - 1]; got slots=",
+                slots_, ", world=", world_);
+    TORCH_CHECK(world_ == 2 || slots_ >= 2,
+                "world > 2 requires at least two ring buffers");
+    TORCH_CHECK(slots_ <= 3,
+                "this ring implementation supports at most three buffers; "
+                "got ", slots_);
+    TORCH_CHECK(handle_bytes_ > 0, "handle_bytes must be positive");
+    TORCH_CHECK(timeout_ms_ > 0, "timeout_ms must be positive");
+
+    if (rank_ == 0) {
+      create_mapping();
+      initialize_mapping();
+    } else {
+      open_mapping();
+      wait_initialized();
+    }
+
+    validate_header();
+  }
+
+  ~RingControl() {
+    try {
+      close(false);
+    } catch (...) {
+    }
+  }
+
+  RingControl(const RingControl &) = delete;
+  RingControl &operator=(const RingControl &) = delete;
+
+  void publish_handle(const py::bytes &handle) {
+    std::string bytes = handle;
+    TORCH_CHECK(
+        static_cast<int>(bytes.size()) == handle_bytes_,
+        "bad IPC handle size: expected ", handle_bytes_,
+        ", got ", bytes.size());
+
+    std::memcpy(handle_ptr(rank_), bytes.data(), bytes.size());
+    publish_epoch(handle_ready(rank_), 1);
+  }
+
+  py::bytes wait_handle(int peer_rank) {
+    check_rank(peer_rank);
+    wait_epoch(handle_ready(peer_rank), 1, timeout_ms_,
+               "IPC handle from rank " + std::to_string(peer_rank));
+    return py::bytes(
+        reinterpret_cast<const char *>(handle_ptr(peer_rank)),
+        static_cast<py::ssize_t>(handle_bytes_));
+  }
+
+  void publish_ready(int receiver_rank, int slot, uint32_t epoch) {
+    check_rank(receiver_rank);
+    check_slot(slot);
+    TORCH_CHECK(epoch > 0, "ready epoch must be positive");
+    publish_epoch(ready(receiver_rank, slot), epoch);
+  }
+
+  void wait_ready(int receiver_rank, int slot, uint32_t epoch) {
+    check_rank(receiver_rank);
+    check_slot(slot);
+    TORCH_CHECK(epoch > 0, "ready epoch must be positive");
+    wait_epoch(
+        ready(receiver_rank, slot), epoch, timeout_ms_,
+        "ready[rank=" + std::to_string(receiver_rank) +
+            "][slot=" + std::to_string(slot) + "]");
+  }
+
+  void publish_free(int owner_rank, int slot, uint32_t epoch) {
+    check_rank(owner_rank);
+    check_slot(slot);
+    TORCH_CHECK(epoch > 0, "free epoch must be positive");
+    publish_epoch(free_slot(owner_rank, slot), epoch);
+  }
+
+  void wait_free(int owner_rank, int slot, uint32_t epoch) {
+    check_rank(owner_rank);
+    check_slot(slot);
+    TORCH_CHECK(epoch > 0, "free epoch must be positive");
+    wait_epoch(
+        free_slot(owner_rank, slot), epoch, timeout_ms_,
+        "free[rank=" + std::to_string(owner_rank) +
+            "][slot=" + std::to_string(slot) + "]");
+  }
+
+  void barrier(uint32_t epoch) {
+    TORCH_CHECK(epoch > 0, "barrier epoch must be positive");
+
+    // Publish first, then wait. This avoids a circular wait where every rank
+    // waits before making its own arrival visible.
+    publish_epoch(barrier_epoch(rank_), epoch);
+    for (int r = 0; r < world_; ++r) {
+      wait_epoch(
+          barrier_epoch(r), epoch, timeout_ms_,
+          "barrier[rank=" + std::to_string(r) + "]");
+    }
+  }
+
+  void publish_work_done(int rank) {
+    check_rank(rank);
+    publish_epoch(work_done(rank), 1);
+  }
+
+  void wait_work_done(int rank) {
+    check_rank(rank);
+    wait_epoch(
+        work_done(rank), 1, timeout_ms_,
+        "work_done[rank=" + std::to_string(rank) + "]");
+  }
+
+  void publish_mapping_closed(int rank) {
+    check_rank(rank);
+    publish_epoch(mapping_closed(rank), 1);
+  }
+
+  void wait_mapping_closed(int rank) {
+    check_rank(rank);
+    wait_epoch(
+        mapping_closed(rank), 1, timeout_ms_,
+        "mapping_closed[rank=" + std::to_string(rank) + "]");
+  }
+
+  void publish_elapsed_ns(int rank, uint64_t elapsed_ns,
+                          uint32_t epoch) {
+    check_rank(rank);
+    TORCH_CHECK(epoch > 0, "elapsed epoch must be positive");
+
+    elapsed_ns_ptr()[rank] = elapsed_ns;
+    publish_epoch(elapsed_ready(rank), epoch);
+  }
+
+  uint64_t wait_max_elapsed_ns(uint32_t epoch) {
+    TORCH_CHECK(epoch > 0, "elapsed epoch must be positive");
+
+    uint64_t maximum = 0;
+    for (int r = 0; r < world_; ++r) {
+      wait_epoch(
+          elapsed_ready(r), epoch, timeout_ms_,
+          "elapsed_ns[rank=" + std::to_string(r) + "]");
+      maximum = std::max(maximum, elapsed_ns_ptr()[r]);
+    }
+    return maximum;
+  }
+
+  void close(bool unlink_name) {
+    if (mapping_ != MAP_FAILED) {
+      munmap(mapping_, layout_.total_size);
+      mapping_ = MAP_FAILED;
+    }
+    if (fd_ >= 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+    if (unlink_name && !unlinked_) {
+      if (shm_unlink(name_.c_str()) != 0 && errno != ENOENT) {
+        TORCH_CHECK(false,
+                    "shm_unlink(", name_, ") failed: errno=", errno,
+                    " (", std::strerror(errno), ")");
+      }
+      unlinked_ = true;
+    }
+  }
+
+private:
+  void create_mapping() {
+    // The name contains a launch-specific digest. Unlinking first also cleans
+    // up a stale object left by an aborted run using the same torchrun port.
+    if (shm_unlink(name_.c_str()) != 0 && errno != ENOENT) {
+      TORCH_CHECK(false,
+                  "shm_unlink(", name_, ") failed: errno=", errno,
+                  " (", std::strerror(errno), ")");
+    }
+
+    fd_ = shm_open(name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    TORCH_CHECK(fd_ >= 0,
+                "shm_open(create ", name_, ") failed: errno=", errno,
+                " (", std::strerror(errno), ")");
+
+    TORCH_CHECK(
+        ftruncate(fd_, static_cast<off_t>(layout_.total_size)) == 0,
+        "ftruncate(", name_, ") failed: errno=", errno,
+        " (", std::strerror(errno), ")");
+
+    map_fd();
+  }
+
+  void open_mapping() {
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms_);
+
+    for (;;) {
+      fd_ = shm_open(name_.c_str(), O_RDWR, 0600);
+      if (fd_ >= 0) {
+        struct stat st {};
+        if (fstat(fd_, &st) == 0 &&
+            static_cast<size_t>(st.st_size) == layout_.total_size) {
+          break;
+        }
+        ::close(fd_);
+        fd_ = -1;
+      } else {
+        TORCH_CHECK(
+            errno == ENOENT,
+            "shm_open(open ", name_, ") failed: errno=", errno,
+            " (", std::strerror(errno), ")");
+      }
+
+      TORCH_CHECK(
+          std::chrono::steady_clock::now() < deadline,
+          "timed out opening shared ring control ", name_);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    map_fd();
+  }
+
+  void map_fd() {
+    mapping_ = mmap(nullptr, layout_.total_size,
+                    PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+    TORCH_CHECK(mapping_ != MAP_FAILED,
+                "mmap(", name_, ") failed: errno=", errno,
+                " (", std::strerror(errno), ")");
+  }
+
+  void initialize_mapping() {
+    std::memset(mapping_, 0, layout_.total_size);
+
+    auto *h = header();
+    new (&h->initialized) std::atomic<uint32_t>(0);
+    h->version = kRingControlVersion;
+    h->world = static_cast<uint32_t>(world_);
+    h->slots = static_cast<uint32_t>(slots_);
+    h->handle_bytes = static_cast<uint32_t>(handle_bytes_);
+    h->reserved = 0;
+    h->magic = kRingControlMagic;
+
+    initialize_atomic_array(layout_.handle_ready_off, world_);
+    initialize_atomic_array(
+        layout_.ready_off,
+        static_cast<size_t>(world_) * slots_);
+    initialize_atomic_array(
+        layout_.free_off,
+        static_cast<size_t>(world_) * slots_);
+    initialize_atomic_array(layout_.barrier_epoch_off, world_);
+    initialize_atomic_array(layout_.work_done_off, world_);
+    initialize_atomic_array(layout_.mapping_closed_off, world_);
+    initialize_atomic_array(layout_.elapsed_ready_off, world_);
+
+    publish_epoch(&h->initialized, 1);
+  }
+
+  void wait_initialized() {
+    wait_epoch(&header()->initialized, 1, timeout_ms_,
+               "ring-control initialization");
+  }
+
+  void validate_header() const {
+    const auto *h = header();
+    TORCH_CHECK(h->magic == kRingControlMagic,
+                "bad ring-control shared-memory magic");
+    TORCH_CHECK(h->version == kRingControlVersion,
+                "ring-control version mismatch: expected ",
+                kRingControlVersion, ", got ", h->version);
+    TORCH_CHECK(static_cast<int>(h->world) == world_,
+                "ring-control world mismatch: expected ", world_,
+                ", got ", h->world);
+    TORCH_CHECK(static_cast<int>(h->slots) == slots_,
+                "ring-control slot mismatch: expected ", slots_,
+                ", got ", h->slots);
+    TORCH_CHECK(static_cast<int>(h->handle_bytes) == handle_bytes_,
+                "ring-control handle size mismatch");
+  }
+
+  void initialize_atomic_array(size_t offset, size_t count) {
+    auto *array = atomic_array(offset);
+    for (size_t i = 0; i < count; ++i) {
+      new (&array[i]) std::atomic<uint32_t>(0);
+      TORCH_CHECK(array[i].is_lock_free(),
+                  "shared uint32_t atomics must be lock-free");
+    }
+  }
+
+  RingControlHeader *header() const {
+    return reinterpret_cast<RingControlHeader *>(mapping_);
+  }
+
+  void *at_offset(size_t offset) const {
+    return static_cast<char *>(mapping_) + offset;
+  }
+
+  std::atomic<uint32_t> *atomic_array(size_t offset) const {
+    return reinterpret_cast<std::atomic<uint32_t> *>(at_offset(offset));
+  }
+
+  std::atomic<uint32_t> *handle_ready(int rank) const {
+    return atomic_array(layout_.handle_ready_off) + rank;
+  }
+
+  void *handle_ptr(int rank) const {
+    return static_cast<char *>(at_offset(layout_.handles_off)) +
+           static_cast<size_t>(rank) * handle_bytes_;
+  }
+
+  std::atomic<uint32_t> *ready(int rank, int slot) const {
+    return atomic_array(layout_.ready_off) +
+           static_cast<size_t>(rank) * slots_ + slot;
+  }
+
+  std::atomic<uint32_t> *free_slot(int rank, int slot) const {
+    return atomic_array(layout_.free_off) +
+           static_cast<size_t>(rank) * slots_ + slot;
+  }
+
+  std::atomic<uint32_t> *barrier_epoch(int rank) const {
+    return atomic_array(layout_.barrier_epoch_off) + rank;
+  }
+
+  std::atomic<uint32_t> *work_done(int rank) const {
+    return atomic_array(layout_.work_done_off) + rank;
+  }
+
+  std::atomic<uint32_t> *mapping_closed(int rank) const {
+    return atomic_array(layout_.mapping_closed_off) + rank;
+  }
+
+  std::atomic<uint32_t> *elapsed_ready(int rank) const {
+    return atomic_array(layout_.elapsed_ready_off) + rank;
+  }
+
+  uint64_t *elapsed_ns_ptr() const {
+    return reinterpret_cast<uint64_t *>(at_offset(layout_.elapsed_ns_off));
+  }
+
+  void check_rank(int rank) const {
+    TORCH_CHECK(rank >= 0 && rank < world_,
+                "rank out of range: ", rank, " for world ", world_);
+  }
+
+  void check_slot(int slot) const {
+    TORCH_CHECK(slot >= 0 && slot < slots_,
+                "slot out of range: ", slot, " for slots ", slots_);
+  }
+
+  std::string name_;
+  int rank_;
+  int world_;
+  int slots_;
+  int handle_bytes_;
+  int64_t timeout_ms_;
+  RingControlLayout layout_;
+  int fd_ = -1;
+  void *mapping_ = MAP_FAILED;
+  bool unlinked_ = false;
+};
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -592,6 +1156,49 @@ void ipc_shutdown() {
 PYBIND11_MODULE(sycl_tla_ipc_p2p, m) {
   m.doc() = "XPU Level-Zero IPC-handle P2P copy engine transfers";
 
+  py::class_<RingControl, std::shared_ptr<RingControl>>(m, "RingControl")
+      .def(py::init<std::string, int, int, int, int, int64_t>(),
+           py::arg("name"),
+           py::arg("rank"),
+           py::arg("world"),
+           py::arg("slots"),
+           py::arg("handle_bytes") = 64,
+           py::arg("timeout_ms") = 30000)
+      .def("publish_handle", &RingControl::publish_handle,
+           py::arg("handle"))
+      .def("wait_handle", &RingControl::wait_handle,
+           py::arg("peer_rank"))
+      .def("publish_ready", &RingControl::publish_ready,
+           py::arg("receiver_rank"), py::arg("slot"), py::arg("epoch"))
+      .def("wait_ready", &RingControl::wait_ready,
+           py::arg("receiver_rank"), py::arg("slot"), py::arg("epoch"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("publish_free", &RingControl::publish_free,
+           py::arg("owner_rank"), py::arg("slot"), py::arg("epoch"))
+      .def("wait_free", &RingControl::wait_free,
+           py::arg("owner_rank"), py::arg("slot"), py::arg("epoch"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("barrier", &RingControl::barrier,
+           py::arg("epoch"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("publish_work_done", &RingControl::publish_work_done,
+           py::arg("rank"))
+      .def("wait_work_done", &RingControl::wait_work_done,
+           py::arg("rank"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("publish_mapping_closed", &RingControl::publish_mapping_closed,
+           py::arg("rank"))
+      .def("wait_mapping_closed", &RingControl::wait_mapping_closed,
+           py::arg("rank"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("publish_elapsed_ns", &RingControl::publish_elapsed_ns,
+           py::arg("rank"), py::arg("elapsed_ns"), py::arg("epoch"))
+      .def("wait_max_elapsed_ns", &RingControl::wait_max_elapsed_ns,
+           py::arg("epoch"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("close", &RingControl::close,
+           py::arg("unlink_name") = false);
+
   py::class_<PendingCopy, std::shared_ptr<PendingCopy>>(m, "PendingCopy")
       .def("wait", &PendingCopy::wait,
            py::call_guard<py::gil_scoped_release>())
@@ -625,3 +1232,4 @@ PYBIND11_MODULE(sycl_tla_ipc_p2p, m) {
         py::arg("dst_local"), py::arg("peer_src"), py::arg("nbytes"),
         py::arg("queue_ptr"));
 }
+

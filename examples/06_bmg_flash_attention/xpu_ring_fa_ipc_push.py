@@ -15,11 +15,12 @@ launching the attention kernel on the block currently in kbuf[read].
 The transfer is a CE *write* into the peer, never a CE read from it. On XPU a
 cross-UPI CE read costs >2x a same-socket one; posted CE writes do not.
 
-Completion is symmetric to the pull version: each rank waits on the event of
-the copy *it issued*, then a barrier establishes that every rank has finished
-sending -- which, since all ranks run the identical schedule, is exactly the
-condition that every rank has finished receiving. No flags, no credits, no
-extra buffers: the memory layout is unchanged from the pull version.
+The receive arena uses at most three slots. Transfers are assigned monotonically
+increasing tickets and slots are selected by ticket modulo the buffer count.
+The sender publishes ready after both K/V CE writes complete. Before reusing a
+slot, the receiver waits for the attention kernel that consumed the old value,
+publishes free, and the sender waits for that free ticket before overwriting the
+peer slot.
 
 Accumulation uses the online-softmax LSE-merge epilogue: round 0 initializes
 out/lse, subsequent rounds merge. out/lse therefore persist across the whole
@@ -33,35 +34,47 @@ Launch (world >= 2):
 
 import argparse
 import atexit
+import hashlib
 import os
 import time
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 
 import sycl_tla_fmha as fa
 import sycl_tla_ipc_p2p as ipc
 
-# buf[0] permanently holds this rank's own K/V block and is never written.
-# (asynchronous) attention kernel and being recycled as a write target.
-# The remaining NUM_BUFFERS-1 slots are copy destinations cycled round-robin.
-# Slot numbering is identical on every rank, so write_slot_of(step) names the
-# same slot in the peer's arena as it does locally.
-NUM_BUFFERS = 3
-
 SLOT_ALIGN = 4096
+MAX_CONTROL_TICKET = (1 << 32) - 1
+
 
 def _align_up(v, a=SLOT_ALIGN):
     return (v + a - 1) // a * a
 
-def read_slot_of(step):
-    return (step - 1) % NUM_BUFFERS
+
+def slot_of_ticket(ticket, num_buffers):
+    if ticket <= 0:
+        raise ValueError(f"ticket must be positive, got {ticket}")
+    return (ticket - 1) % num_buffers
 
 
-def write_slot_of(step):
-    return step % NUM_BUFFERS
+def ring_control_name(world):
+    """
+    Build a node-local launch-specific POSIX shm name.
+
+    torchrun normally provides TORCHELASTIC_RUN_ID and MASTER_PORT. Hashing the
+    complete token also removes characters that are illegal in shm_open names.
+    """
+    token = "|".join([
+        os.environ.get("TORCHELASTIC_RUN_ID", ""),
+        os.environ.get("MASTER_ADDR", "localhost"),
+        os.environ.get("MASTER_PORT", "29500"),
+        str(world),
+        os.environ.get("USER", ""),
+    ])
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+    return f"/sycl_tla_ring_{digest}"
 
 
 def parse_args():
@@ -90,9 +103,12 @@ def parse_args():
     p.add_argument("--check-transfer", action="store_true",
                    help="Only validate the IPC K/V rotation (no attention "
                         "kernel). Run this first when debugging.")
-    p.add_argument("--backend", type=str, default="xccl",
-                   help="bootstrap process group backend; used only for "
-                        "handle exchange, barriers and reductions")
+    p.add_argument("--num-buffers", type=int, default=3, choices=(2, 3),
+                   help="Maximum number of IPC receive buffers. Three is the "
+                        "recommended default; world=2 automatically uses one.")
+    p.add_argument("--control-timeout-ms", type=int, default=30000,
+                   help="Timeout for shared-memory ready/free/teardown waits; "
+                        "a timeout raises instead of hanging indefinitely")
     p.add_argument("--profile", action="store_true",
                    help="Dump a PyTorch profiler trace over the timed loops")
     p.add_argument("--profile-dir", type=str, default="./profiler_out",
@@ -101,12 +117,10 @@ def parse_args():
     return p.parse_args()
 
 
-def init_distributed(backend):
+def init_process():
     rank = int(os.environ.get("RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    if not dist.is_initialized():
-        dist.init_process_group(backend=backend, rank=rank, world_size=world)
     torch.xpu.set_device(local_rank)
     return rank, world, local_rank
 
@@ -140,18 +154,39 @@ def current_queue_ptr(device):
 
 class IpcKVRing:
     """
-    所有 ring buffer 都住在一块 IpcArena 里：进程生命周期内只导出 1 个 IPC handle、
-    只 open 1 次对端。这样上层每层新建的 k/v tensor 只需要 stage() 进 slot 0，
-    handle 永远不会因为 caching allocator 回收/复用 slab 而变野指针。
+    All received K/V blocks live in one persistent IpcArena.
+
+    Initial local K/V stays in the caller-owned tensors. Received blocks rotate
+    through at most three arena slots. ready/free ticket counters protect each
+    slot from being read before arrival or overwritten before compute finishes.
     """
 
-    def __init__(self, k_local, v_local, rank, world, queue_ptr):
+    def __init__(
+        self,
+        k_local,
+        v_local,
+        rank,
+        world,
+        queue_ptr,
+        control_timeout_ms,
+        num_buffers,
+    ):
         self.rank = rank
         self.world = world
+        if world == 2:
+            self.num_buffers = 1
+        else:
+            if num_buffers not in (2, 3):
+                raise ValueError(
+                    "num_buffers must be 2 or 3 when world > 2"
+                )
+            self.num_buffers = min(num_buffers, world - 1)
+
+        self.control_timeout_ms = control_timeout_ms
         self.queue_ptr = queue_ptr
         self.dev_index = k_local.device.index
-        # Push: we write into next_rank and are written into by prev_rank.
         self.next_rank = (rank + 1) % world
+        self.prev_rank = (rank - 1) % world
 
         self.k_shape = list(k_local.shape)
         self.v_shape = list(v_local.shape)
@@ -159,29 +194,41 @@ class IpcKVRing:
         self.k_nbytes = k_local.numel() * k_local.element_size()
         self.v_nbytes = v_local.numel() * v_local.element_size()
 
-        # arena 布局: slot0[K][V] slot1[K][V] ... 每段 4KB 对齐。
+        # Arena layout: slot0[K][V], slot1[K][V], ...
         self.k_off_in_slot = 0
         self.v_off_in_slot = _align_up(self.k_nbytes)
         self.slot_stride = _align_up(self.v_off_in_slot + self.v_nbytes)
-        total = self.slot_stride * NUM_BUFFERS
+        total = self.slot_stride * self.num_buffers
 
         self.arena = ipc.make_arena(self.dev_index, total, queue_ptr)
 
         self.k_off = [i * self.slot_stride + self.k_off_in_slot
-                      for i in range(NUM_BUFFERS)]
+                      for i in range(self.num_buffers)]
         self.v_off = [i * self.slot_stride + self.v_off_in_slot
-                      for i in range(NUM_BUFFERS)]
+                      for i in range(self.num_buffers)]
         self.kbuf = [self.arena.view(o, self.k_shape, self.dtype)
                      for o in self.k_off]
         self.vbuf = [self.arena.view(o, self.v_shape, self.dtype)
                      for o in self.v_off]
 
+        # For every local receive slot, track the ticket currently being
+        # consumed and an event recorded after its attention launch.
+        self.slot_compute_done = [None] * self.num_buffers
 
-        # 只交换一次 arena base handle；各 slot 的 offset 所有 rank 一致。
+        self.control = ipc.RingControl(
+            name=ring_control_name(world),
+            rank=rank,
+            world=world,
+            slots=self.num_buffers,
+            handle_bytes=64,
+            timeout_ms=control_timeout_ms,
+        )
+
+        # Publish first, then wait for next_rank. Publishing first prevents a
+        # circular bootstrap dependency.
         self.local_handle = self.arena.export_handle()
-        gathered = [None] * world
-        dist.all_gather_object(gathered, self.local_handle)
-        self.peer_handle = gathered[self.next_rank]
+        self.control.publish_handle(self.local_handle)
+        self.peer_handle = self.control.wait_handle(self.next_rank)
 
         peer_base = ipc.open_peer(self.dev_index, self.peer_handle, queue_ptr)
         self.k_peer_ptr = [peer_base + o for o in self.k_off]
@@ -190,87 +237,211 @@ class IpcKVRing:
         self._closed = False
         atexit.register(self.close)
 
-        # 任何 copy 发出前，所有 rank 必须已经 open 完对端。
-        dist.barrier()
-        torch.xpu.synchronize()
+        # Bootstrap-only rendezvous: all peer mappings must be open before any
+        # process can issue its first CE write.
+        self.control.barrier(1)
+
+    def record_local_consumer(self, slot, ticket):
+        state = self.slot_compute_done[slot]
+        if state is not None:
+            old_ticket, _ = state
+            raise RuntimeError(
+                f"rank {self.rank}: slot {slot} still tracks ticket "
+                f"{old_ticket}; cannot record ticket {ticket}"
+            )
+
+        done = torch.xpu.Event()
+        done.record(torch.xpu.current_stream())
+        self.slot_compute_done[slot] = (ticket, done)
+
+    def release_local_slot(self, slot, expected_ticket):
+        """
+        Wait until local compute has stopped reading a slot, then publish the
+        free ticket so prev_rank may overwrite it.
+
+        The forwarding CE read of this slot is already complete: every ring
+        round waits for its outgoing K/V PendingCopy objects before advancing.
+        """
+        state = self.slot_compute_done[slot]
+        if state is None:
+            raise RuntimeError(
+                f"rank {self.rank}: slot {slot} has no compute event; "
+                f"expected ticket {expected_ticket}"
+            )
+
+        ticket, done = state
+        if ticket != expected_ticket:
+            raise RuntimeError(
+                f"rank {self.rank}: slot {slot} tracks ticket {ticket}, "
+                f"expected ticket {expected_ticket}"
+            )
+
+        deadline = (
+            time.monotonic() + self.control_timeout_ms / 1000.0
+        )
+        while not done.query():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"rank {self.rank}: timed out waiting for compute "
+                    f"to release slot {slot}, ticket {ticket}, "
+                    f"timeout_ms={self.control_timeout_ms}"
+                )
+
+            # Yield the host thread without adding a millisecond-scale delay.
+            time.sleep(0)
+
+        self.slot_compute_done[slot] = None
+        self.control.publish_free(self.rank, slot, ticket)
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        try:
-            torch.xpu.synchronize()
-            ipc.close_peer(self.dev_index, self.peer_handle, self.queue_ptr)
-        except Exception:
-            pass
+        ipc.close_peer(self.dev_index, self.peer_handle, self.queue_ptr)
         self.k_peer_ptr = []
         self.v_peer_ptr = []
-        # arena view 必须先失效，arena 本身由 ipc.shutdown() 释放。
+        # Views must be invalidated before ipc.shutdown() frees the arena.
         self.kbuf = []
         self.vbuf = []
 
 
-def ring_attention_ipc(ring, consume, kv_new=None):
+def ring_attention_ipc(ring, consume, kv_new, epoch):
     """
-    One full ring pass. Round s presents the K/V block owned by rank
-    (rank - s) % world and calls consume(k_block, v_block, s).
+    One ring pass using a globally continuous transfer-ticket sequence.
 
-    kv_new: optional (k, v) freshly produced by the caller (a transformer layer
-    in the real workload). Staged into slot 0 before the ring starts, which is
-    what upstream code will actually do every layer. Pass None to reuse whatever
-    slot 0 already holds.
-    All ranks follow the identical slot schedule, so rank r pushes its own
-    buf[read_slot_of(s)] -- the block it is reading this round -- into
-    next_rank's buf[write_slot_of(s)].
+    For pass epoch E and world W:
 
-    Each rank waits on the events of the copies *it* issued, then hits a
-    barrier. Because the schedule is identical everywhere, "everyone finished
-    sending" is equivalent to "everyone finished receiving", so no flag or
-    credit protocol is needed. The barrier runs after the attention kernel has
-    been enqueued, so it serializes the host, not the GPU: the kernel and the
-    copy engine keep overlapping across it.
+      pass_base = (E - 1) * (W - 1)
 
-    buf[0] is never a write target, so the next pass starts from this rank's
-    own block with no restore copy.
+    Outgoing step s has ticket pass_base+s+1. The data consumed by attention
+    step s>0 arrived with ticket pass_base+s.
+
+    A slot is ticket-modulo-num_buffers. Before ticket T overwrites its slot,
+    every rank first releases its own old ticket T-num_buffers, then waits for
+    next_rank to release the corresponding destination slot. Publishing local
+    free before waiting for peer free prevents a circular host-side wait.
     """
+
+    if epoch <= 0:
+        raise ValueError(f"epoch must be positive, got {epoch}")
+
+    transfers_per_pass = ring.world - 1
+    pass_base = (epoch - 1) * transfers_per_pass
+    last_ticket = pass_base + transfers_per_pass
+    if last_ticket > MAX_CONTROL_TICKET:
+        raise OverflowError(
+            "ring transfer ticket exceeds the uint32 shared-control range: "
+            f"last_ticket={last_ticket}"
+        )
 
     k_src0, v_src0 = kv_new
+
+    # The copy-engine queue is independent of the current PyTorch/SYCL stream.
+    # Keep this synchronization until producer->CE ordering is represented by
+    # an explicit cross-queue event/dependency.
     torch.xpu.current_stream(v_src0.device).synchronize()
 
     for step in range(ring.world):
+        if step == 0:
+            source_ticket = None
+            read_slot = None
+            src_k_tensor = k_src0
+            src_v_tensor = v_src0
+            src_k_ptr = k_src0.data_ptr()
+            src_v_ptr = v_src0.data_ptr()
+        else:
+            # Incoming transfer step-1 produced the data for attention step.
+            source_ticket = pass_base + step
+            read_slot = slot_of_ticket(
+                source_ticket, ring.num_buffers
+            )
+
+            # prev_rank publishes only after both K and V CE writes complete.
+            ring.control.wait_ready(
+                ring.rank, read_slot, source_ticket
+            )
+
+            src_k_tensor = ring.kbuf[read_slot]
+            src_v_tensor = ring.vbuf[read_slot]
+            base = ring.arena.base_ptr()
+            src_k_ptr = base + ring.k_off[read_slot]
+            src_v_ptr = base + ring.v_off[read_slot]
+
         pending = []
         if step < ring.world - 1:
-            rs, ws = read_slot_of(step), write_slot_of(step)
-            base = ring.arena.base_ptr()
-            # round 0 的 source 是调用方自己的 tensor（不在 arena 里）；
-            # 之后转发的是上一轮收到的那个 arena 槽。
-            if step == 0:
-                src_k, src_v = k_src0.data_ptr(), v_src0.data_ptr()
-            else:
-                src_k, src_v = base + ring.k_off[rs], base + ring.v_off[rs]
+            ticket = pass_base + step + 1
+            write_slot = slot_of_ticket(
+                ticket, ring.num_buffers
+            )
+            previous_ticket = ticket - ring.num_buffers
+
+            if previous_ticket > 0:
+                # Critical deadlock-avoidance ordering:
+                #
+                #   1. release our local slot to prev_rank;
+                #   2. wait until next_rank releases its slot to us.
+                #
+                # If every rank waited first, the rank ring could deadlock.
+                ring.release_local_slot(
+                    write_slot,
+                    expected_ticket=previous_ticket,
+                )
+                ring.control.wait_free(
+                    ring.next_rank,
+                    write_slot,
+                    previous_ticket,
+                )
+
             pending.append(ipc.copy_async(
-                ring.dev_index, ring.k_peer_ptr[ws], src_k,
+                ring.dev_index, ring.k_peer_ptr[write_slot], src_k_ptr,
                 ring.k_nbytes, ring.queue_ptr))
             pending.append(ipc.copy_async(
-                ring.dev_index, ring.v_peer_ptr[ws], src_v,
+                ring.dev_index, ring.v_peer_ptr[write_slot], src_v_ptr,
                 ring.v_nbytes, ring.queue_ptr))
 
-        rs = read_slot_of(step)
-        # Enqueued asynchronously; overlaps the copy engine transfers above.
-        # step 0 读调用方的 tensor，之后读 arena 槽。
-        if step == 0:
-            consume(k_src0, v_src0, step)
-        else:
-            consume(ring.kbuf[rs], ring.vbuf[rs], step)
+        # Local attention and outgoing CE transfer are both readers of the same
+        # K/V block, so they may safely overlap.
+        consume(src_k_tensor, src_v_tensor, step)
+
+        if source_ticket is not None:
+            # Record immediately after enqueueing attention. On an in-order
+            # compute stream, event completion means the kernel no longer reads
+            # this local receive slot.
+            ring.record_local_consumer(
+                read_slot, source_ticket
+            )
 
         for h in pending:
             h.wait()
 
-        # Every rank has now finished sending, hence every rank has finished
-        # receiving. This is what replaces the pull version's implicit
-        # completion guarantee -- and it is the only synchronization the push
-        # model adds.
-        dist.barrier()
+        if pending:
+            # Publish only after both remote K and V writes have completed.
+            ring.control.publish_ready(
+                ring.next_rank, write_slot, ticket
+            )
+
+
+def shutdown_ring(ring):
+    """
+    Tear down IPC mappings without torch.distributed synchronization.
+
+    Phase 1: all ranks stop compute/copy work.
+    Phase 2: each rank closes its mapping to next_rank.
+    Phase 3: each arena owner waits until prev_rank closed the mapping to it.
+    """
+    torch.xpu.synchronize()
+
+    ring.control.publish_work_done(ring.rank)
+    ring.control.wait_work_done(ring.next_rank)
+
+    ring.close()
+
+    # mapping_closed[r] means rank r closed its outgoing mapping to r+1.
+    ring.control.publish_mapping_closed(ring.rank)
+    ring.control.wait_mapping_closed(ring.prev_rank)
+
+    ipc.shutdown()
+    ring.control.close(unlink_name=(ring.rank == 0))
 
 
 def main():
@@ -279,13 +450,14 @@ def main():
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
         raise RuntimeError("No available XPU device was detected")
 
-    rank, world, local_rank = init_distributed(args.backend)
+    rank, world, local_rank = init_process()
     if world < 2:
         if rank == 0:
             print(f"[SKIP] need world >= 2, got {world}")
-        if dist.is_initialized():
-            dist.destroy_process_group()
         return
+
+    if args.control_timeout_ms <= 0:
+        raise ValueError("--control-timeout-ms must be positive")
 
     dev = torch.device("xpu", local_rank)
     dtype = torch.bfloat16
@@ -313,7 +485,12 @@ def main():
     lse = torch.empty((1, s_local, Hq), device=dev, dtype=torch.float32)
 
     queue_ptr = current_queue_ptr(dev)
-    ring = IpcKVRing(k_local, v_local, rank, world, queue_ptr)
+    ring = IpcKVRing(
+        k_local, v_local, rank, world, queue_ptr,
+        args.control_timeout_ms,
+        args.num_buffers,
+    )
+    next_epoch = 1
 
     # ---------------------------------------------------------------- #
     # Transfer self-check: does round s deliver rank (rank-s)'s K/V shard?
@@ -331,7 +508,9 @@ def main():
             if not torch.equal(vb, v_ref):
                 failures.append((step, "V", (vb != v_ref).sum().item()))
 
-        ring_attention_ipc(ring, check, kv_new=(k_local, v_local))
+        ring_attention_ipc(
+            ring, check, kv_new=(k_local, v_local), epoch=next_epoch
+        )
         torch.xpu.synchronize()
         if failures:
             for step, which, bad in failures:
@@ -340,25 +519,23 @@ def main():
         else:
             print(f"[rank {rank}] IPC K/V rotation: PASSED "
                   f"({world} rounds, bit-exact)", flush=True)
-        dist.barrier()
-        ring.close()
-        dist.barrier()
-        ipc.shutdown()
-        dist.destroy_process_group()
+
+        shutdown_ring(ring)
         return
 
     def run_ring():
+        nonlocal next_epoch
         # round_idx drives the epilogue: 0 initializes out/lse, >0 LSE-merges.
         # out/lse accumulate across the whole pass and must not be reset.
-        # kv_new 模拟真实场景：每层 transformer 产出新的 k/v tensor，先 stage 进
-        # arena 再进 ring。这次 D2D copy 是实际部署时无法回避的开销。
         ring_attention_ipc(
             ring,
             lambda kb, vb, step: fa.prefill_bf16_bshd_kv_round(
                 q=q, k=kb, v=vb, out=out, lse=lse, round_idx=step,
             ),
             kv_new=(k_local, v_local),
+            epoch=next_epoch,
         )
+        next_epoch += 1
 
     element_size = torch.tensor([], dtype=dtype).element_size()
     q_bytes = 1 * s_local * Hq * Dqk * element_size
@@ -373,13 +550,16 @@ def main():
         print(f"  Q heads / KV heads : {Hq} / {Hkv}")
         print(f"  QK hdim / V hdim   : {Dqk} / {Dvo}")
         print(f"  Data type          : {dtype}")
-        print(f"  Ring buffers       : {NUM_BUFFERS} x2 "
-              f"(1 pinned + {NUM_BUFFERS - 1} rotating, K and V)")
-        print(f"  Bootstrap backend  : {args.backend}")
+        print(f"  Ring buffers       : {ring.num_buffers} x2 "
+              f"(cyclic destination slots, K and V)")
+        print(f"  Buffer limit       : {args.num_buffers} "
+              f"(effective {ring.num_buffers})")
+        print("  Control plane      : POSIX shm + futex "
+              "(no torch.distributed scheduling)")
+        print(f"  Control timeout    : {args.control_timeout_ms} ms")
         print("  Transfer path      : CE write to peer "
               "(zeCommandListAppendMemoryCopy, dedicated copy engine)")
-        print("  Per-loop staging   : enabled (new K/V copied into arena, "
-              "matches per-layer model behavior)")
+        print("  Initial local K/V  : caller tensors outside the IPC arena")
         print(f"  Verify             : {not args.skip_verify}")
         print(f"  Profile            : {args.profile}")
         print(f"  Warmup loops       : {args.warmup}")
@@ -389,7 +569,7 @@ def main():
     for _ in range(args.warmup):
         run_ring()
     torch.xpu.synchronize()
-    dist.barrier()
+    ring.control.barrier(2)
 
     prof = None
     if args.profile:
@@ -410,6 +590,7 @@ def main():
             prof.step()
     torch.xpu.synchronize()
     elapsed_seconds = time.perf_counter() - start
+    elapsed_ns = int(elapsed_seconds * 1_000_000_000)
 
     if prof is not None:
         prof.__exit__(None, None, None)
@@ -428,10 +609,14 @@ def main():
         print(f"\n[rank {rank}] Profiler key averages:\n{table}", flush=True)
         print(f"[rank {rank}] Chrome trace written to {trace_path}", flush=True)
 
-    # Throughput is bounded by the slowest rank.
-    elapsed_tensor = torch.tensor([elapsed_seconds], device=dev)
-    dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
-    elapsed_max = elapsed_tensor.item()
+    # Throughput is bounded by the slowest rank. This replaces dist.all_reduce
+    # with one shared-memory publication per rank, outside the timed interval.
+    elapsed_result_epoch = 1
+    ring.control.publish_elapsed_ns(
+        rank, elapsed_ns, elapsed_result_epoch
+    )
+    elapsed_max_ns = ring.control.wait_max_elapsed_ns(elapsed_result_epoch)
+    elapsed_max = elapsed_max_ns / 1_000_000_000.0
 
     per_rank_flops = attention_flops(
         q_seq_len=s_local,
@@ -444,8 +629,6 @@ def main():
 
     average_seconds = elapsed_max / args.loops
     moved_bytes = kv_bytes * (world - 1)
-    # stage() 每 pass 一次本地 D2D（写 + 读），计入有效带宽会更贴近真实。
-    staged_bytes = kv_bytes
 
     if rank == 0:
         print("\nResults")
@@ -454,8 +637,6 @@ def main():
         print(f"  Per-rank Q memory  : {q_bytes / 1024**3:.3f} GiB")
         print(f"  Per-rank KV memory : {kv_bytes / 1024**3:.3f} GiB")
         print(f"  Moved / loop / rank: {moved_bytes / 1024**2:.1f} MiB")
-        print(f"  Staged / loop /rank: {staged_bytes / 1024**2:.1f} MiB "
-              f"(local D2D into arena slot 0)")
         print(f"  Total time (max)   : {elapsed_max:.6f} s")
         print(f"  Average latency    : {average_seconds * 1e3:.3f} ms")
         print(f"  FLOPs/loop (rank)  : {per_rank_flops / 1e12:.6f} TFLOP")
@@ -501,13 +682,7 @@ def main():
             print("  Tolerance          : atol=5e-3, rtol=5e-3")
         print(f"  [rank {rank}] max abs diff : {max_abs_diff:.6e}", flush=True)
 
-    dist.barrier()
-    ring.close()
-    dist.barrier()
-    # shutdown 必须早于 destroy_process_group，且早于解释器卸载 extension。
-    ipc.shutdown()
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    shutdown_ring(ring)
 
 
 if __name__ == "__main__":
