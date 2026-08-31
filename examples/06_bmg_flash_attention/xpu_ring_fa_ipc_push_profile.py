@@ -147,7 +147,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=(
             "Benchmark and validate sycl_tla_fmha ring attention with "
-            "Level-Zero IPC P2P overlap on XPU."
+            "SYCL IPC P2P overlap on XPU."
         )
     )
     p.add_argument(
@@ -371,18 +371,21 @@ class IpcKVRing:
         # consumed and an event recorded after its attention launch.
         self.slot_compute_done = [None] * self.num_buffers
 
+        # SYCL IPC handle size is implementation-defined. Export the handle
+        # before constructing the POSIX shared-memory control layout.
+        self.local_handle = self.arena.export_handle()
+
         self.control = ipc.RingControl(
             name=ring_control_name(world),
             rank=rank,
             world=world,
             slots=self.num_buffers,
-            handle_bytes=64,
+            handle_bytes=len(self.local_handle),
             timeout_ms=control_timeout_ms,
         )
 
         # Publish first, then wait for next_rank. Publishing first prevents a
         # circular bootstrap dependency.
-        self.local_handle = self.arena.export_handle()
         self.control.publish_handle(self.local_handle)
         self.peer_handle = self.control.wait_handle(self.next_rank)
 
@@ -401,8 +404,8 @@ class IpcKVRing:
         self._closed = False
         atexit.register(self.close)
 
-        # Bootstrap-only rendezvous: all peer mappings must be open before any
-        # process can issue its first CE write.
+        # Bootstrap-only rendezvous: every peer USM mapping must be open before
+        # any process can issue its first peer write.
         self.control.barrier(1)
 
     def record_local_consumer(self, slot, ticket):
@@ -424,8 +427,8 @@ class IpcKVRing:
         Wait until local compute has stopped reading a slot, then publish the
         free ticket so prev_rank may overwrite it.
 
-        The forwarding CE read of this slot is already complete: every ring
-        round waits for its outgoing K/V PendingCopy objects before advancing.
+        The forwarding SYCL memcpy read is already complete: every ring round
+        waits for its outgoing K/V PendingCopy objects before advancing.
         """
         state = self.slot_compute_done[slot]
 
@@ -519,9 +522,9 @@ def ring_attention_ipc(ring, consume, kv_new, epoch):
 
     k_src0, v_src0 = kv_new
 
-    # The copy-engine queue is independent of the current PyTorch/SYCL stream.
-    # Keep this synchronization until producer->CE ordering is represented by
-    # an explicit cross-queue event/dependency.
+    # The IPC memcpy queue is independent of the current PyTorch/SYCL stream.
+    # Keep this synchronization until producer->copy ordering is represented
+    # by an explicit cross-queue event/dependency.
     torch.xpu.current_stream(v_src0.device).synchronize()
 
     # No ITT/profile calls are allowed inside this loop.
@@ -541,7 +544,7 @@ def ring_attention_ipc(ring, consume, kv_new, epoch):
                 ring.num_buffers,
             )
 
-            # prev_rank publishes only after both K and V CE writes complete.
+            # prev_rank publishes only after both K and V copies complete.
             ring.control.wait_ready(
                 ring.rank,
                 read_slot,
@@ -601,8 +604,8 @@ def ring_attention_ipc(ring, consume, kv_new, epoch):
                 )
             )
 
-        # Local attention and outgoing CE transfer are both readers of the same
-        # K/V block, so they may safely overlap.
+        # Local attention and outgoing SYCL copies both read the same K/V
+        # block, so they may safely overlap.
         consume(
             src_k_tensor,
             src_v_tensor,
@@ -622,7 +625,7 @@ def ring_attention_ipc(ring, consume, kv_new, epoch):
             handle.wait()
 
         if pending:
-            # Publish only after both remote K and V writes have completed.
+            # Publish only after both peer K and V writes have completed.
             ring.control.publish_ready(
                 ring.next_rank,
                 write_slot,
@@ -878,7 +881,7 @@ def main():
     kv_bytes = ring.k_nbytes + ring.v_nbytes
 
     if rank == 0:
-        print("XPU BF16 ring attention (Level-Zero IPC P2P overlap)")
+        print("XPU BF16 ring attention (SYCL IPC P2P overlap)")
         print("  Input layout       : [B, S, H, D]")
         print(f"  World size         : {world}")
         print(f"  Global seq len     : {s_global}")
@@ -903,8 +906,12 @@ def main():
             f"{args.control_timeout_ms} ms"
         )
         print(
-            "  Transfer path      : CE write to peer "
-            "(zeCommandListAppendMemoryCopy, dedicated copy engine)"
+            "  IPC memory API     : SYCL experimental ipc::memory"
+        )
+        print("  Arena allocation   : aligned device USM")
+        print(
+            "  Transfer path      : SYCL queue.memcpy write to peer "
+            "(independent in-order queue)"
         )
         print(
             "  Initial local K/V  : caller tensors outside the IPC arena"
@@ -932,8 +939,8 @@ def main():
                 "'itt' module is unavailable."
             )
             print(
-                "          unitrace will still capture Level Zero kernels "
-                "and device activity, but custom ITT labels will be absent."
+                "          unitrace will still capture SYCL/backend device "
+                "activity, but custom ITT labels will be absent."
             )
             print("          Install with: python -m pip install ittapi")
 

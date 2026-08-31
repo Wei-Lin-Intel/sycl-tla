@@ -3,8 +3,8 @@ Build the sycl_tla_ipc_p2p extension:
 
     python setup_ipc_p2p.py build_ext --inplace
 
-Requires the oneAPI DPC++ compiler (icpx) and Level-Zero headers/loader
-(ze_loader) available on the system.
+Requires a oneAPI DPC++ compiler/runtime that implements
+sycl_ext_oneapi_inter_process_communication.
 """
 
 import os
@@ -30,9 +30,7 @@ module = CppExtension(
     ],
     extra_link_args=[
         "-fsycl",
-        "-lze_loader",
     ],
-    libraries=["ze_loader"],
 )
 
 setup(
