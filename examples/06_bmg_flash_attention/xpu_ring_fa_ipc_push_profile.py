@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Ring attention over prefill_bf16_bshd_kv_round with Level-Zero IPC P2P overlap.
+Ring attention over prefill_bf16_bshd_kv_round with SYCL IPC P2P overlap.
 
 Same math as xpu_ring_fa.py, but K/V rotation goes through sycl_tla_ipc_p2p
-(zeCommandListAppendMemoryCopy on a dedicated copy engine) instead of
-torch.distributed batch_isend_irecv. The copy engine is fully decoupled from
-the SYCL compute queue, so the transfer overlaps the attention kernel without
-the collective's host-side serialization.
+(experimental SYCL IPC memory and queue.memcpy on an independent SYCL queue)
+instead of torch.distributed batch_isend_irecv. The copy queue is decoupled
+from the PyTorch compute queue, allowing transfer to overlap the attention
+kernel without the collective's host-side serialization.
 
 Push model: rank r opens next_rank's K/V ring buffers once, then each round
 issues local.kbuf[read] -> next_rank.kbuf[write] (and the same for V) while
 launching the attention kernel on the block currently in kbuf[read].
 
-The transfer is a CE write into the peer, never a CE read from it. On XPU a
-cross-UPI CE read costs more than a same-socket one; posted CE writes do not.
+Each transfer is a SYCL USM memcpy whose destination is the next rank's peer
+IPC mapping. It therefore retains the push/write direction rather than reading
+from peer memory. Physical engine selection is handled by the SYCL runtime.
 
 The receive arena uses at most three slots. Transfers are assigned monotonically
 increasing tickets and slots are selected by ticket modulo the buffer count.
-The sender publishes ready after both K/V CE writes complete. Before reusing a
+The sender publishes ready after both K/V SYCL copies complete. Before reusing a
 slot, the receiver waits for the attention kernel that consumed the old value,
 publishes free, and the sender waits for that free ticket before overwriting the
 peer slot.
@@ -80,8 +81,8 @@ import sycl_tla_ipc_p2p as ipc
 
 # Optional ITT markers. unitrace captures these with --chrome-itt-logging.
 #
-# Profiling still captures Level Zero kernel/device activity if ittapi is not
-# installed; only the custom ring-dispatch labels will be absent.
+# Profiling still captures SYCL/backend device activity if ittapi is not
+# installed; only the custom ring-dispatch labels are absent.
 try:
     import itt  # pip install ittapi
 
